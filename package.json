@@ -1,0 +1,26 @@
+{
+  "name": "swing-trading-app",
+  "version": "1.0.0",
+  "description": "",
+  "main": "index.js",
+  "scripts": {
+    "test": "echo \"Error: no test specified\" && exit 1",
+    "sdlc": "tsx pipeline/run.ts"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/ayalonmen/Swing-Trading-App.git"
+  },
+  "keywords": [],
+  "author": "",
+  "license": "ISC",
+  "type": "commonjs",
+  "bugs": {
+    "url": "https://github.com/ayalonmen/Swing-Trading-App/issues"
+  },
+  "homepage": "https://github.com/ayalonmen/Swing-Trading-App#readme",
+  "devDependencies": {
+    "tsx": "^4.23.0",
+    "typescript": "^6.0.3"
+  }
+}
