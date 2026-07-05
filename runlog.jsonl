@@ -1,0 +1,5 @@
+{"stage":"parse","ticket":"001","mode":"approve","durationMs":56075,"approved":true}
+{"stage":"parse","ticket":"001","mode":"approve","durationMs":69492,"approved":false}
+{"stage":"parse","ticket":"001","mode":"approve","durationMs":51117,"approved":true}
+{"stage":"parse","ticket":"001","mode":"approve","durationMs":113273,"approved":false,"feedback":"dont like the Stop-loss vs. signal-exit priority, change it to somting else"}
+{"stage":"parse","ticket":"001","mode":"approve","durationMs":58226,"approved":true}

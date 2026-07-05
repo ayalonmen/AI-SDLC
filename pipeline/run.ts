@@ -13,6 +13,7 @@ import { createInterface } from "node:readline/promises";
 
 type StageMode = "manual" | "approve" | "auto";
 type Config = { stages: Record<string, { mode: StageMode }> };
+type RetryContext = { priorAttempt: string; feedback: string };
 
 function readConfig(): Config {
   return JSON.parse(readFileSync("sdlc.config.json", "utf8"));
@@ -27,23 +28,46 @@ function readTicket(id: string): string {
 }
 
 // Builds the prompt the parse agent sees: shared project context, its
-// role description, then the raw ticket it needs to clean up.
-function buildParsePrompt(ticketText: string): string {
+// role description, the raw ticket it needs to clean up, and — if a prior
+// attempt was rejected — the rejected output plus the reviewer's feedback,
+// so the agent revises instead of starting over blind.
+function buildParsePrompt(ticketText: string, retry?: RetryContext): string {
   const projectContext = readFileSync("CLAUDE.md", "utf8");
   const roleDescription = readFileSync("agents/parse.md", "utf8");
-  return [
-    projectContext,
-    roleDescription,
-    "## Ticket to parse",
-    ticketText,
-  ].join("\n\n---\n\n");
+  const sections = [projectContext, roleDescription, "## Ticket to parse", ticketText];
+
+  if (retry) {
+    sections.push(
+      [
+        "## Your previous attempt was rejected",
+        `Reviewer feedback: ${retry.feedback}`,
+        "",
+        "Previous output:",
+        retry.priorAttempt,
+        "",
+        "Produce a revised version addressing the feedback.",
+      ].join("\n")
+    );
+  }
+
+  return sections.join("\n\n---\n\n");
 }
 
 // Invokes Claude Code headlessly and returns its text output.
+//
+// The prompt travels over stdin rather than as a CLI argument: on Windows,
+// npm installs "claude" as a .cmd shim, and cmd.exe re-parses argv, which
+// mangles long/multiline text. Stdin sidesteps that and works the same on
+// every platform. Because the only argv content is the static "-p" flag
+// (no untrusted data), it's safe to pass shell: true, which Windows also
+// requires to launch .cmd files directly (Node refuses without it).
 function runParseAgent(prompt: string): string {
-  const result = spawnSync("claude", ["-p", prompt], {
+  const claudeCommand = process.platform === "win32" ? "claude.cmd" : "claude";
+  const result = spawnSync(claudeCommand, ["-p"], {
+    input: prompt,
     encoding: "utf8",
     maxBuffer: 10 * 1024 * 1024,
+    shell: process.platform === "win32",
   });
   if (result.error) {
     throw new Error(`Failed to invoke claude CLI: ${result.error.message}`);
@@ -61,14 +85,30 @@ async function confirm(question: string): Promise<boolean> {
   return answer.trim().toLowerCase().startsWith("y");
 }
 
+async function promptText(question: string): Promise<string> {
+  const rl = createInterface({ input: process.stdin, output: process.stdout });
+  const answer = await rl.question(`${question} `);
+  rl.close();
+  return answer.trim();
+}
+
 function logRun(entry: Record<string, unknown>): void {
   appendFileSync("runlog.jsonl", JSON.stringify(entry) + "\n");
 }
 
-async function runStageParse(ticketId: string, mode: StageMode): Promise<void> {
+// Runs the parse stage, and if the mode is "approve" and the human rejects
+// the output, loops: ask what should change, log the rejection with that
+// feedback, then re-run the same stage with the rejected output and the
+// feedback folded into the prompt so the agent revises instead of guessing
+// again from scratch. Keeps looping until the human approves.
+async function runStageParse(
+  ticketId: string,
+  mode: StageMode,
+  retry?: RetryContext
+): Promise<void> {
   const startedAt = Date.now();
   const ticketText = readTicket(ticketId);
-  const prompt = buildParsePrompt(ticketText);
+  const prompt = buildParsePrompt(ticketText, retry);
 
   console.log(`\nRunning parse agent on ticket ${ticketId}...\n`);
   const output = runParseAgent(prompt);
@@ -77,25 +117,46 @@ async function runStageParse(ticketId: string, mode: StageMode): Promise<void> {
   console.log(output);
   console.log("\n-------------------------------\n");
 
-  let approved = true;
-  if (mode === "approve") {
-    approved = await confirm("Append this to the ticket?");
+  if (mode !== "approve") {
+    appendFileSync(`tickets/${ticketId}.md`, "\n" + output + "\n");
+    console.log(`Saved to tickets/${ticketId}.md`);
+    logRun({
+      stage: "parse",
+      ticket: ticketId,
+      mode,
+      durationMs: Date.now() - startedAt,
+      approved: true,
+    });
+    return;
   }
+
+  const approved = await confirm("Approve this output?");
 
   if (approved) {
     appendFileSync(`tickets/${ticketId}.md`, "\n" + output + "\n");
     console.log(`Saved to tickets/${ticketId}.md`);
-  } else {
-    console.log("Discarded. Ticket file left unchanged.");
+    logRun({
+      stage: "parse",
+      ticket: ticketId,
+      mode,
+      durationMs: Date.now() - startedAt,
+      approved: true,
+    });
+    return;
   }
 
+  const feedback = await promptText("What should change?");
   logRun({
     stage: "parse",
     ticket: ticketId,
     mode,
     durationMs: Date.now() - startedAt,
-    approved,
+    approved: false,
+    feedback,
   });
+
+  console.log("\nRe-running parse agent with your feedback...\n");
+  await runStageParse(ticketId, mode, { priorAttempt: output, feedback });
 }
 
 async function main(): Promise<void> {

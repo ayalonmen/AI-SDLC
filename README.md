@@ -53,10 +53,21 @@ parse agent responds with:
   - Decisions made to resolve ambiguity
         │
         ▼
-orchestrator prints the result and asks: "Append this to the ticket? (y/n)"
+orchestrator prints the result and asks: "Approve this output? (y/n)"
         │
         ├─ y → appended to tickets/001.md, logged to runlog.jsonl
-        └─ n → discarded, logged to runlog.jsonl
+        │
+        └─ n → asks "What should change?"
+                 │
+                 ▼
+               logs the rejection + your feedback to runlog.jsonl
+                 │
+                 ▼
+               re-runs the parse agent, this time including the
+               rejected output and your feedback in its prompt
+                 │
+                 ▼
+               (loops back to "Approve this output?" until you say y)
 ```
 
 Only the `parse` stage exists so far. Later sessions add `spec`,
@@ -78,8 +89,8 @@ Swing Trading App/
 ├── tickets/
 │   └── 001.md            a feature request, written by hand, with parse agent output appended below the divider
 ├── pipeline/
-│   └── run.ts            the orchestrator: reads config + ticket, calls the agent, waits for approval, saves, logs
-└── runlog.jsonl          one JSON line appended per pipeline run (stage, ticket, mode, duration, approved)
+│   └── run.ts            the orchestrator: reads config + ticket, calls the agent, waits for approval, retries on rejection with feedback, saves, logs
+└── runlog.jsonl          one JSON line appended per pipeline run (stage, ticket, mode, duration, approved, and feedback when rejected)
 ```
 
 ## Prerequisites
