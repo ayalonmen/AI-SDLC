@@ -28,8 +28,8 @@ risk limits).
 - No look-ahead bias: a decision made using a bar's close must not be
   filled at that same close.
 - Files are the handoff protocol between pipeline stages. Agents read and
-  write plain files under `tickets/`, `specs/`, `reviews/`, `qa/` (folders
-  arrive as the stages that use them come online).
+  write plain files under `tickets/`, `specs/` (`reviews/`, `qa/` arrive as
+  the stages that use them come online).
 
 ## Pipeline
 

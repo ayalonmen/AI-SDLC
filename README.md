@@ -15,8 +15,9 @@ Two things live in this repo:
    tested, deployed change, with configurable human-in-the-loop approval
    at each stage.
 
-This README covers Session 1 of the pipeline: one ticket, one agent
-(parse), one approval pause.
+So far the pipeline wires up two stages: a ticket moves through `parse`
+and then `spec`, each an independent agent with its own approval pause
+and its own reject-with-feedback retry loop.
 
 ## Why an AI-SDLC pipeline
 
@@ -32,7 +33,7 @@ Files are the handoff between stages — an agent reads files, writes
 output, and the next stage picks it up from disk. That keeps every step
 inspectable and auditable instead of buried in chat history.
 
-## How Session 1 works
+## How it works
 
 ```
 you write tickets/001.md (a fuzzy feature request)
@@ -41,21 +42,24 @@ you write tickets/001.md (a fuzzy feature request)
 npm run sdlc run 001
         │
         ▼
-pipeline/run.ts (the orchestrator)
-  - reads sdlc.config.json to check the "parse" stage's mode
-  - reads CLAUDE.md + agents/parse.md + tickets/001.md
-  - calls `claude -p` headlessly with that combined prompt
+pipeline/run.ts (the orchestrator) runs each configured stage in order
+```
+
+Every stage (`parse`, `spec`, ...) follows the same generic loop, via a
+shared `runStage()` helper in `pipeline/run.ts`:
+
+```
+reads sdlc.config.json to check this stage's mode
+reads CLAUDE.md + agents/<stage>.md + this stage's input
+calls `claude -p` headlessly with that combined prompt
         │
         ▼
-parse agent responds with:
-  - Tasks
-  - Acceptance Criteria
-  - Decisions made to resolve ambiguity
+agent responds with its stage-specific output
         │
         ▼
 orchestrator prints the result and asks: "Approve this output? (y/n)"
         │
-        ├─ y → appended to tickets/001.md, logged to runlog.jsonl
+        ├─ y → saved wherever this stage's output belongs, logged to runlog.jsonl
         │
         └─ n → asks "What should change?"
                  │
@@ -63,17 +67,26 @@ orchestrator prints the result and asks: "Approve this output? (y/n)"
                logs the rejection + your feedback to runlog.jsonl
                  │
                  ▼
-               re-runs the parse agent, this time including the
+               re-runs the same agent, this time including the
                rejected output and your feedback in its prompt
                  │
                  ▼
                (loops back to "Approve this output?" until you say y)
 ```
 
-Only the `parse` stage exists so far. Later sessions add `spec`,
-`implement`, `review`, `test`, `QA`, and `deploy`, each with its own
-agent prompt under `agents/` and its own entry in `sdlc.config.json`.
-QA and deploy will always be hard gates — never configurable to `auto`.
+Stages wired up so far:
+
+- **parse** — input: the raw ticket. Output: Tasks / Acceptance Criteria /
+  Decisions, appended to `tickets/<id>.md`.
+- **spec** — input: the ticket (now including parse's approved criteria).
+  Read-only (`allowedTools: ["Read"]`). Output: a concrete implementation
+  spec (types, function signatures, edge cases, file layout), written to
+  `specs/<id>.md`.
+
+Later sessions add `implement`, `review`, `test`, `QA`, and `deploy`,
+each with its own agent prompt under `agents/` and its own entry in
+`sdlc.config.json`. QA and deploy will always be hard gates — never
+configurable to `auto`.
 
 ## File structure
 
@@ -85,11 +98,14 @@ Swing Trading App/
 ├── package.json          npm scripts, incl. `sdlc` which runs the orchestrator
 ├── tsconfig.json         TypeScript config for the pipeline code
 ├── agents/
-│   └── parse.md          the parse agent's role prompt (read-only; turns a fuzzy request into tasks + acceptance criteria)
+│   ├── parse.md          the parse agent's role prompt (read-only; turns a fuzzy request into tasks + acceptance criteria)
+│   └── spec.md           the spec agent's role prompt (read-only; turns approved criteria into types, function signatures, edge cases, file layout)
 ├── tickets/
 │   └── 001.md            a feature request, written by hand, with parse agent output appended below the divider
+├── specs/
+│   └── 001.md            the spec agent's output for this ticket (created once the spec stage runs)
 ├── pipeline/
-│   └── run.ts            the orchestrator: reads config + ticket, calls the agent, waits for approval, retries on rejection with feedback, saves, logs
+│   └── run.ts            the orchestrator: a generic runStage() helper (build prompt, call agent, approve/reject-with-retry, save, log), plus a thin per-stage wrapper for parse and for spec
 └── runlog.jsonl          one JSON line appended per pipeline run (stage, ticket, mode, duration, approved, and feedback when rejected)
 ```
 
@@ -107,15 +123,15 @@ Install dependencies (already done if `node_modules` exists):
 npm install
 ```
 
-Run the parse stage on a ticket:
+Run the pipeline on a ticket:
 
 ```bash
 npm run sdlc run 001
 ```
 
-This reads `tickets/001.md`, runs the parse agent, shows you its output,
-and asks for approval before writing anything. Every run — approved or
-not — is recorded in `runlog.jsonl`.
+This runs `parse`, then (once approved) runs `spec` using the updated
+ticket, pausing for your approval at each configured stage. Every run —
+approved or rejected — is recorded in `runlog.jsonl`.
 
 To try a new feature request, create a new ticket file (e.g.
 `tickets/002.md`) with your own rough description, then run
@@ -128,7 +144,8 @@ To try a new feature request, create a new ticket file (e.g.
 ```json
 {
   "stages": {
-    "parse": { "mode": "approve" }
+    "parse": { "mode": "approve" },
+    "spec": { "mode": "approve" }
   }
 }
 ```
