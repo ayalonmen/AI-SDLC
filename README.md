@@ -1,4 +1,4 @@
-# Swing Trading App
+# SDLC
 
 A paper-trading / backtest engine for a swing trading strategy, built
 using its own AI-driven SDLC pipeline.
