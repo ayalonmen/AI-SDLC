@@ -1,4 +1,4 @@
-# SDLC
+# ai-sdlc-starter
 
 A paper-trading / backtest engine for a swing trading strategy, built
 using its own AI-driven SDLC pipeline.
