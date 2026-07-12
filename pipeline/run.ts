@@ -8,12 +8,45 @@
 //   npm run sdlc run 001
 
 import { readFileSync, appendFileSync, existsSync, mkdirSync, writeFileSync } from "node:fs";
-import { spawnSync } from "node:child_process";
+import { resolve, relative, sep, isAbsolute } from "node:path";
+import { spawn, spawnSync } from "node:child_process";
 import { createInterface } from "node:readline/promises";
-import { runBuild } from "./gates";
+import { runChecks, runE2E, GateResult, checkQaVerdict, checkCoverage } from "./gates";
+import { checkBundle, PRODUCT_KB_SPEC } from "./kb-conformance";
 
 type StageMode = "manual" | "approve" | "auto";
-type Config = { stages: Record<string, { mode: StageMode; maxTurns?: number }> };
+type ProjectConfig = { productPath: string; knowledgePath: string };
+type Config = {
+  project: ProjectConfig;
+  stages: Record<string, { mode: StageMode; maxTurns?: number }>;
+  // Optional post-ticket learning loop (Retrospector, then Curators). Off by
+  // omission so the writing flow runs standalone on a fork that hasn't opted in.
+  learning?: { enabled: boolean };
+};
+
+type ProductComponent = { path: string; check: string; test?: string };
+type ProductDescriptor = {
+  name: string;
+  components: Record<string, ProductComponent>;
+  e2e?: { run: string; testDir?: string };
+};
+
+// Resolved once at startup and passed down, so no function reaches for a
+// global. workdir is the absolute product repo path; knowledgeDir is the
+// absolute knowledge repo path.
+type Paths = { workdir: string; knowledgeDir: string };
+
+// Bundles everything resolved once in main() so it can be threaded through
+// as a single value instead of three separate params. Inside each stage,
+// ctx only reaches the code-touching calls (buildPrompt, callAgent,
+// ensureBranch, runChecks) — artifact reads/writes stay pipeline-local and
+// never touch ctx.
+type Ctx = {
+  config: Config;
+  paths: Paths;
+  descriptor: ProductDescriptor;
+};
+
 type RetryContext = { priorAttempt: string; feedback: string };
 
 // Bounded retry for the implement stage's automated fix loop (agent ->
@@ -22,14 +55,58 @@ type RetryContext = { priorAttempt: string; feedback: string };
 // hard ceiling or a persistently broken spec could retry forever.
 const MAX_IMPLEMENT_ATTEMPTS = 3;
 
+// Separate, smaller budget for E2E infra-failures specifically (PocketBase
+// never came up, a port was taken, etc.). These retry the GATE, never the
+// agent — there's no code to fix — so they don't share a counter with
+// MAX_IMPLEMENT_ATTEMPTS. Exhausting this is an environment problem, not a
+// code problem, and stops the pipeline for a human rather than looping the
+// agent against a harness that isn't the code's fault.
+const MAX_INFRA_RETRIES = 2;
+
+// Cap on the QA -> implement -> QA belt. A QA failure (failing test or a
+// coverage gap) means the code or its coverage is wrong, so work goes back to
+// implement (which has its own syntax gate), then QA re-runs. Bounded like the
+// implement belt so a persistently-failing feature summons a human.
+const MAX_QA_ATTEMPTS = 3;
+
 // The pipeline's fixed stage sequence. Both the auto-resume logic and the
 // default run order in main() walk this same list, so adding a stage
-// later (QA, deploy) means adding it here once.
-const STAGE_ORDER = ["parse", "spec", "implement", "review", "test"] as const;
+// later (deploy) means adding it here once.
+const STAGE_ORDER = ["parse", "spec", "implement", "review", "test", "qa"] as const;
 type Stage = (typeof STAGE_ORDER)[number];
 
 function readConfig(): Config {
-  return JSON.parse(readFileSync("sdlc.config.json", "utf8"));
+  const config: Config = JSON.parse(readFileSync("sdlc.config.json", "utf8"));
+  if (!config.project?.productPath) {
+    throw new Error("sdlc.config.json missing project.productPath");
+  }
+  if (!config.project?.knowledgePath) {
+    throw new Error("sdlc.config.json missing project.knowledgePath");
+  }
+  return config;
+}
+
+function resolvePaths(config: Config): Paths {
+  const workdir = resolve(config.project.productPath);
+  const knowledgeDir = resolve(config.project.knowledgePath);
+
+  if (!existsSync(workdir)) {
+    throw new Error(`Product repo not found at ${workdir} (project.productPath).`);
+  }
+  // Validate the knowledge repo exists now, even though nothing writes to it
+  // until Steps 4-5. Fail early rather than mid-run later.
+  if (!existsSync(knowledgeDir)) {
+    throw new Error(`Knowledge repo not found at ${knowledgeDir} (project.knowledgePath).`);
+  }
+  return { workdir, knowledgeDir };
+}
+
+function readProductDescriptor(workdir: string): ProductDescriptor {
+  const path = resolve(workdir, ".sdlc/product.json");
+  if (!existsSync(path)) {
+    throw new Error(`Product descriptor not found at ${path}. Every product needs .sdlc/product.json.`);
+  }
+  return JSON.parse(readFileSync(path, "utf8"));
 }
 
 function readTicket(id: string): string {
@@ -50,22 +127,27 @@ function readSpec(id: string): string {
 
 // Creates (or, on a rerun, switches to) an isolated feature branch before
 // the implement stage runs, so an agent with Write/Edit/Bash access never
-// touches main directly.
-function ensureBranch(ticketId: string): string {
+// touches main directly. Runs against the product repo (cwd), not the
+// pipeline repo — the branch being created lives in the product's git history.
+function ensureBranch(ticketId: string, cwd: string): string {
   const branch = `feature/${ticketId}`;
   const alreadyExists =
-    spawnSync("git", ["rev-parse", "--verify", branch], { encoding: "utf8" }).status === 0;
-  const result = spawnSync("git", alreadyExists ? ["checkout", branch] : ["checkout", "-b", branch], {
-    encoding: "utf8",
-  });
+    spawnSync("git", ["rev-parse", "--verify", branch], { cwd, encoding: "utf8" }).status === 0;
+  const result = spawnSync(
+    "git",
+    alreadyExists ? ["checkout", branch] : ["checkout", "-b", branch],
+    { cwd, encoding: "utf8" }
+  );
   if (result.status !== 0) {
-    throw new Error(`Failed to switch to branch ${branch}: ${result.stderr}`);
+    throw new Error(`Failed to switch to branch ${branch} in ${cwd}: ${result.stderr}`);
   }
   return branch;
 }
 
-// Builds the prompt a stage agent sees: shared project context, its role
-// description (from roleFile), the input it's working on, and — if a
+// Builds the prompt a stage agent sees: the PRODUCT's project context
+// (its own CLAUDE.md — stack, conventions, rules), its role description
+// (from roleFile, which stays in the pipeline repo — role prompts are
+// generic, not product-specific), the input it's working on, and — if a
 // prior attempt was rejected — the rejected output plus the reviewer's
 // feedback, so the agent revises instead of starting over blind.
 //
@@ -75,10 +157,39 @@ function ensureBranch(ticketId: string): string {
 // "here's what I see in your repo, what would you like me to do?" instead
 // of just doing the stage's job. An explicit "produce your output now, no
 // questions, no preamble" instruction reliably prevents that.
-function buildPrompt(roleFile: string, input: string, retry?: RetryContext): string {
-  const projectContext = readFileSync("CLAUDE.md", "utf8");
+function buildPrompt(
+  workdir: string,
+  roleFile: string,
+  input: string,
+  retry?: RetryContext,
+  kbIndex?: { dir: string; indexText: string }
+): string {
+  const productClaudeMd = `${workdir}/CLAUDE.md`;
+  const projectContext = existsSync(productClaudeMd) ? readFileSync(productClaudeMd, "utf8") : "";
   const roleDescription = readFileSync(roleFile, "utf8");
-  const sections = [projectContext, roleDescription, "## Input", input];
+  const sections = [projectContext, roleDescription].filter(Boolean);
+
+  // Inject the KB index (small) so the agent knows what durable knowledge
+  // exists and can read the concept files it needs ON DEMAND from disk — the KB
+  // dir is added as a readable root via callAgent's addDir. Only the index is
+  // injected; concept bodies are never bulk-loaded.
+  if (kbIndex) {
+    sections.push(
+      [
+        "## Project knowledge base",
+        "A knowledge base of durable facts about this product is available at:",
+        `  ${kbIndex.dir}`,
+        "Read concept files from there ON DEMAND — only the ones relevant to this",
+        "task — and follow what they say. Paths in the index below are relative to",
+        "that directory. Do not load concepts you don't need.",
+        "",
+        "### Index",
+        kbIndex.indexText,
+      ].join("\n")
+    );
+  }
+
+  sections.push("## Input", input);
 
   if (retry) {
     sections.push(
@@ -103,6 +214,19 @@ function buildPrompt(roleFile: string, input: string, retry?: RetryContext): str
   return sections.join("\n\n---\n\n");
 }
 
+// Reads the knowledge repo's root index.md, if present, for the KB-reading
+// stages (parse/spec/implement/review). The index is small and injected every
+// such call; concept bodies are read by the agent on demand (callAgent's addDir
+// grants read access to knowledgeDir). Returns undefined when there's no index,
+// so a stage runs EXACTLY as before on a fork with no KB — the feature can't
+// regress the writing flow. NB: the index sits at the repo root (knowledgeDir),
+// not under a bundle/ subdir, matching the OKF layout.
+function readKbIndex(knowledgeDir: string): { dir: string; indexText: string } | undefined {
+  const indexPath = `${knowledgeDir}/index.md`;
+  if (!existsSync(indexPath)) return undefined;
+  return { dir: knowledgeDir, indexText: readFileSync(indexPath, "utf8") };
+}
+
 // Quotes each part and joins them into one command-line string, for
 // platforms that need shell: true. Node deprecates (DEP0190) passing an
 // args array alongside shell: true, because it has to join them into one
@@ -114,6 +238,31 @@ function quoteCommandLine(parts: string[]): string {
   return parts.map((part) => `"${part.replace(/"/g, '\\"')}"`).join(" ");
 }
 
+// How long a single agent invocation may run before the orchestrator kills
+// it and fails loudly. Nothing else bounds this: --allowedTools scopes WHAT
+// the agent can touch, not how long it can run, and maxTurns (see below)
+// isn't enforced by the CLI at all. Without a ceiling, an agent stuck
+// retrying a tool call it has no permission for (or just exploring
+// indefinitely) hangs the pipeline forever with no way to tell it apart
+// from a slow-but-fine run.
+const AGENT_TIMEOUT_MS = 10 * 60 * 1000;
+
+// Kills the whole process tree, not just the immediate child. On Windows
+// the claude CLI runs under `shell: true` (cmd.exe wrapping claude.cmd
+// wrapping node.exe); a bare child.kill() only signals cmd.exe and can
+// leave the real work orphaned and still running. taskkill /T recurses.
+function killTree(pid: number): void {
+  if (process.platform === "win32") {
+    spawnSync("taskkill", ["/pid", String(pid), "/T", "/F"]);
+  } else {
+    try {
+      process.kill(-pid, "SIGKILL");
+    } catch {
+      // process group already gone
+    }
+  }
+}
+
 // Invokes Claude Code headlessly and returns its text output.
 //
 // The prompt travels over stdin rather than as a CLI argument: on Windows,
@@ -123,33 +272,193 @@ function quoteCommandLine(parts: string[]): string {
 // at all (Node refuses without it) — see quoteCommandLine above for why
 // that's paired with a pre-built command string rather than an args array.
 //
+// Runs via async spawn() rather than spawnSync() so stdout/stderr can be
+// streamed to the console as they arrive, instead of appearing all at once
+// (or not at all) only after the whole call returns — a long-running stage
+// used to look identical to a hung one because nothing could be printed
+// while Node was blocked synchronously inside spawnSync.
+//
 // allowedTools scopes what the agent can touch — e.g. the spec stage is
 // read-only, so it's invoked with allowedTools: ["Read"], matching the
 // "read-only agent" permission scoping described for parse/spec/review.
+//
+// cwd is the product repo. Launching the claude CLI there — not in the
+// pipeline repo — is what makes it auto-load the PRODUCT's own CLAUDE.md
+// and git state, on top of the product CLAUDE.md text buildPrompt already
+// injects explicitly. Belt and suspenders: the explicit injection guarantees
+// the content reaches the prompt even for read-only stages where auto-load
+// behavior is less predictable; cwd makes git state (branch, diff) real too.
 //
 // maxTurns is accepted for forward compatibility with sdlc.config.json's
 // implement.maxTurns, but this CLI version (checked via `claude --help`)
 // has no turn-limiting flag, only --max-budget-usd (a dollar cap, not a
 // turn cap). It is intentionally NOT enforced here rather than silently
-// mapped to a different unit. The build gate is today's real safety net
-// for an unattended implement run, not a turn limit.
-function callAgent(prompt: string, opts?: { allowedTools?: string[]; maxTurns?: number }): string {
+// mapped to a different unit. AGENT_TIMEOUT_MS above is the real ceiling
+// on an unattended run now, not a turn limit.
+// Best-effort single-token description of what a tool call acted on, for the
+// live activity feed (agent_tool_use events).
+function toolTarget(input: unknown): string {
+  if (!input || typeof input !== "object") return "";
+  const i = input as Record<string, unknown>;
+  if (typeof i.file_path === "string") return i.file_path;
+  if (typeof i.path === "string") return i.path;
+  if (typeof i.pattern === "string") return i.pattern;
+  if (typeof i.command === "string") return i.command.slice(0, 60);
+  return "";
+}
+
+// If absFile is inside kbDir, return its bundle-relative path (forward slashes);
+// otherwise null. Used to recognize a Read that "reaches into" the KB.
+function kbRelative(kbDir: string, absFile: string): string | null {
+  const rel = relative(kbDir, resolve(absFile));
+  if (rel.startsWith("..") || isAbsolute(rel)) return null;
+  return rel.split(sep).join("/");
+}
+
+// Runs a headless Claude Code agent and returns its final text. Uses
+// --output-format stream-json (which the CLI requires --verbose for) so the
+// orchestrator can SEE the agent's tool calls as they happen — that visibility
+// is what powers the live telemetry: every tool call becomes an agent_tool_use
+// event, and a Read under the KB dir (opts.addDir) becomes a kb_read event, so
+// a dashboard can show an agent "reaching for the KB" in real time. The final
+// text still comes back to callers exactly as before (from the terminal
+// "result" event), so switching output format is transparent to every stage.
+function callAgent(
+  prompt: string,
+  opts: {
+    cwd: string;
+    allowedTools?: string[];
+    maxTurns?: number;
+    addDir?: string;
+    // Tag emitted telemetry events so the UI can attribute them to a run/stage.
+    ticket?: string;
+    stage?: string;
+  }
+): Promise<string> {
   const claudeCommand = process.platform === "win32" ? "claude.cmd" : "claude";
+  // addDir grants the agent read access to a directory OUTSIDE its cwd (the
+  // product repo) — used to hand the KB-reading stages the knowledge repo.
+  // Woven into `args` HERE, before the ...args spread that BOTH branches below
+  // consume: the POSIX branch passes the array to spawn, the win32 branch spreads
+  // it through quoteCommandLine into one quoted command string. Building it here
+  // means the path is individually quoted on Windows (spaces-safe) and DEP0190
+  // stays avoided. Do NOT move this into the spawn/command-string call sites.
+  const dirArgs = opts?.addDir ? ["--add-dir", opts.addDir] : [];
+  // stream-json emits one JSON event per line (assistant/tool_use/result/…);
+  // the CLI rejects it in --print mode without --verbose.
+  const streamArgs = ["--output-format", "stream-json", "--verbose"];
   const args = opts?.allowedTools
-    ? ["--allowedTools", opts.allowedTools.join(","), "-p"]
-    : ["-p"];
-  const spawnOptions = { input: prompt, encoding: "utf8" as const, maxBuffer: 10 * 1024 * 1024 };
-  const result =
-    process.platform === "win32"
-      ? spawnSync(quoteCommandLine([claudeCommand, ...args]), { ...spawnOptions, shell: true })
-      : spawnSync(claudeCommand, args, spawnOptions);
-  if (result.error) {
-    throw new Error(`Failed to invoke claude CLI: ${result.error.message}`);
-  }
-  if (result.status !== 0) {
-    throw new Error(`claude CLI exited with code ${result.status}: ${result.stderr}`);
-  }
-  return result.stdout.trim();
+    ? [...dirArgs, "--allowedTools", opts.allowedTools.join(","), ...streamArgs, "-p"]
+    : [...dirArgs, ...streamArgs, "-p"];
+
+  const kbDir = opts.addDir;
+
+  return new Promise((resolvePromise, reject) => {
+    const child =
+      process.platform === "win32"
+        ? spawn(quoteCommandLine([claudeCommand, ...args]), { cwd: opts.cwd, shell: true })
+        : // detached makes the child its own process-group leader, so killTree's
+          // `process.kill(-pid)` on timeout actually reaches the whole tree
+          // (without it the negative-pid group signal throws ESRCH and the child
+          // is orphaned). Windows uses taskkill /T instead and needs no equivalent.
+          spawn(claudeCommand, args, { cwd: opts.cwd, detached: true });
+
+    let stderr = "";
+    let lineBuf = "";
+    let resultText = "";
+    let sawResult = false;
+    const textParts: string[] = []; // fallback if no terminal result event
+    let timedOut = false;
+
+    const timer = setTimeout(() => {
+      timedOut = true;
+      if (child.pid) killTree(child.pid);
+    }, AGENT_TIMEOUT_MS);
+
+    const handleEvent = (ev: any) => {
+      if (!ev || typeof ev !== "object") return;
+      if (ev.type === "assistant" && ev.message && Array.isArray(ev.message.content)) {
+        for (const block of ev.message.content) {
+          if (block.type === "text" && typeof block.text === "string") {
+            textParts.push(block.text);
+            process.stdout.write(block.text);
+          } else if (block.type === "tool_use") {
+            const name = String(block.name ?? "tool");
+            const target = toolTarget(block.input);
+            process.stdout.write(`\n  → ${name}${target ? " " + target : ""}\n`);
+            emitEvent("agent_tool_use", { ticket: opts.ticket, stage: opts.stage, tool: name, target });
+            if (name === "Read" && kbDir && block.input && typeof block.input.file_path === "string") {
+              const rel = kbRelative(kbDir, block.input.file_path);
+              if (rel !== null) {
+                emitEvent("kb_read", { ticket: opts.ticket, stage: opts.stage, file: rel });
+              }
+            }
+          }
+        }
+      } else if (ev.type === "result") {
+        sawResult = true;
+        if (typeof ev.result === "string") resultText = ev.result;
+      }
+    };
+
+    const handleLine = (raw: string) => {
+      const line = raw.trim();
+      if (!line) return;
+      let ev: unknown;
+      try {
+        ev = JSON.parse(line);
+      } catch {
+        return; // not a JSON event line (stray diagnostic output) — ignore
+      }
+      // handleEvent runs OUTSIDE the parse guard on purpose: an exception here
+      // (e.g. emitEvent's appendFileSync failing) is a real IO/logic error and
+      // must not be silently swallowed as "not JSON".
+      handleEvent(ev);
+    };
+
+    child.stdout!.setEncoding("utf8");
+    child.stdout!.on("data", (chunk: string) => {
+      lineBuf += chunk;
+      let idx: number;
+      while ((idx = lineBuf.indexOf("\n")) >= 0) {
+        const line = lineBuf.slice(0, idx);
+        lineBuf = lineBuf.slice(idx + 1);
+        handleLine(line);
+      }
+    });
+
+    child.stderr!.setEncoding("utf8");
+    child.stderr!.on("data", (chunk: string) => {
+      stderr += chunk;
+    });
+
+    child.on("error", (err) => {
+      clearTimeout(timer);
+      reject(new Error(`Failed to invoke claude CLI: ${err.message}`));
+    });
+
+    child.on("close", (code) => {
+      clearTimeout(timer);
+      if (lineBuf.trim()) handleLine(lineBuf); // flush a final unterminated line
+      if (timedOut) {
+        reject(
+          new Error(
+            `claude CLI timed out after ${AGENT_TIMEOUT_MS / 1000}s and was killed.\n` +
+              `Partial output:\n${(sawResult ? resultText : textParts.join("")).trim()}\n${stderr}`
+          )
+        );
+        return;
+      }
+      if (code !== 0) {
+        reject(new Error(`claude CLI exited with code ${code}: ${stderr}`));
+        return;
+      }
+      resolvePromise((sawResult ? resultText : textParts.join("")).trim());
+    });
+
+    child.stdin!.write(prompt);
+    child.stdin!.end();
+  });
 }
 
 async function confirm(question: string): Promise<boolean> {
@@ -168,6 +477,16 @@ async function promptText(question: string): Promise<string> {
 
 function logRun(entry: Record<string, unknown>): void {
   appendFileSync("runlog.jsonl", JSON.stringify(entry) + "\n");
+}
+
+// Fine-grained, real-time telemetry for a live UI. Unlike runlog.jsonl (one row
+// per finished stage — the durable resume state machine), events.jsonl is an
+// append-only, timestamped NDJSON stream written AS things happen: run/stage
+// lifecycle, per-tool-call activity (incl. kb_read when an agent opens a KB
+// concept), gate results, and belt routing. A dashboard tails this file to show
+// the pipeline live. It is telemetry only — nothing here gates the pipeline.
+function emitEvent(type: string, data: Record<string, unknown> = {}): void {
+  appendFileSync("events.jsonl", JSON.stringify({ ts: new Date().toISOString(), type, ...data }) + "\n");
 }
 
 function readRunlog(): Array<{ stage?: string; ticket?: string; approved?: boolean }> {
@@ -218,6 +537,10 @@ type StageOptions = {
   getInput: () => string;
   onApprove: (output: string) => void;
   allowedTools?: string[];
+  // When true, inject the product KB index and add the KB dir as a readable
+  // root. Set on the KB-reading stages (parse/spec/review); test does NOT read
+  // the KB (it works from the spec + code), and qa is deterministic.
+  usesKb?: boolean;
 };
 
 // Generic stage runner: build the prompt, call the agent, show the
@@ -229,13 +552,23 @@ type StageOptions = {
 // the agent revises instead of guessing again from scratch. Keeps
 // looping until the human approves. "auto" mode skips the pause entirely
 // since there's no human to ask.
-async function runStage(opts: StageOptions, retry?: RetryContext): Promise<void> {
+async function runStage(opts: StageOptions, ctx: Ctx, retry?: RetryContext): Promise<void> {
   const startedAt = Date.now();
   const input = opts.getInput();
-  const prompt = buildPrompt(opts.roleFile, input, retry);
+  const kb = opts.usesKb ? readKbIndex(ctx.paths.knowledgeDir) : undefined;
+  const prompt = buildPrompt(ctx.paths.workdir, opts.roleFile, input, retry, kb);
+
+  emitEvent("stage_started", { ticket: opts.ticketId, stage: opts.stage, mode: opts.mode, retry: retry ? true : undefined });
+  emitEvent("agent_started", { ticket: opts.ticketId, stage: opts.stage, kb: { offered: !!kb, dir: kb ? kb.dir : undefined } });
 
   console.log(`\nRunning ${opts.stage} agent on ticket ${opts.ticketId}...\n`);
-  const output = callAgent(prompt, { allowedTools: opts.allowedTools });
+  const output = await callAgent(prompt, {
+    cwd: ctx.paths.workdir,
+    allowedTools: opts.allowedTools,
+    addDir: kb ? kb.dir : undefined,
+    ticket: opts.ticketId,
+    stage: opts.stage,
+  });
 
   console.log(`----- ${opts.stage} agent output -----\n`);
   console.log(output);
@@ -251,6 +584,7 @@ async function runStage(opts: StageOptions, retry?: RetryContext): Promise<void>
       durationMs: Date.now() - startedAt,
       approved: true,
     });
+    emitEvent("stage_finished", { ticket: opts.ticketId, stage: opts.stage, approved: true, durationMs: Date.now() - startedAt });
   };
 
   if (opts.mode !== "approve") {
@@ -273,20 +607,29 @@ async function runStage(opts: StageOptions, retry?: RetryContext): Promise<void>
     approved: false,
     feedback,
   });
+  emitEvent("stage_finished", { ticket: opts.ticketId, stage: opts.stage, approved: false, durationMs: Date.now() - startedAt });
 
   console.log(`\nRe-running ${opts.stage} agent with your feedback...\n`);
-  await runStage(opts, { priorAttempt: output, feedback });
+  await runStage(opts, ctx, { priorAttempt: output, feedback });
 }
 
-function runStageParse(ticketId: string, mode: StageMode): Promise<void> {
-  return runStage({
-    stage: "parse",
-    ticketId,
-    mode,
-    roleFile: "agents/parse.md",
-    getInput: () => readTicket(ticketId),
-    onApprove: (output) => appendFileSync(`tickets/${ticketId}.md`, "\n" + output + "\n"),
-  });
+function runStageParse(ticketId: string, mode: StageMode, ctx: Ctx): Promise<void> {
+  return runStage(
+    {
+      stage: "parse",
+      ticketId,
+      mode,
+      roleFile: "agents/parse.md",
+      getInput: () => readTicket(ticketId),
+      // Read-scoped now that it gets a readable root into the KB repo — parse
+      // returns its output as text (the orchestrator appends it), so it never
+      // needed write tools, and this keeps it from writing to the KB.
+      allowedTools: ["Read"],
+      usesKb: true,
+      onApprove: (output) => appendFileSync(`tickets/${ticketId}.md`, "\n" + output + "\n"),
+    },
+    ctx
+  );
 }
 
 function writeSpec(ticketId: string, output: string): void {
@@ -294,61 +637,141 @@ function writeSpec(ticketId: string, output: string): void {
   writeFileSync(`specs/${ticketId}.md`, output);
 }
 
-function runStageSpec(ticketId: string, mode: StageMode): Promise<void> {
-  return runStage({
-    stage: "spec",
-    ticketId,
-    mode,
-    roleFile: "agents/spec.md",
-    // The ticket now includes the parse stage's approved criteria, which
-    // is exactly what the spec agent needs to work from.
-    getInput: () => readTicket(ticketId),
-    allowedTools: ["Read"],
-    onApprove: (output) => writeSpec(ticketId, output),
-  });
+function runStageSpec(ticketId: string, mode: StageMode, ctx: Ctx): Promise<void> {
+  return runStage(
+    {
+      stage: "spec",
+      ticketId,
+      mode,
+      roleFile: "agents/spec.md",
+      // The ticket now includes the parse stage's approved criteria, which
+      // is exactly what the spec agent needs to work from.
+      getInput: () => readTicket(ticketId),
+      allowedTools: ["Read"],
+      usesKb: true,
+      onApprove: (output) => writeSpec(ticketId, output),
+    },
+    ctx
+  );
+}
+
+// Implement's gate is now light: syntax only. Authoritative testing (the full
+// E2E suite + coverage) moved to QA. Implement self-corrects against syntax;
+// all behavioral correction happens via the QA -> implement belt. A syntax
+// failure is always a real-failure (route back to implement); there is no
+// infra-failure path here because nothing stands up the app.
+async function runImplementGate(ctx: Ctx): Promise<GateResult> {
+  return runChecks(ctx.paths.workdir, ctx.descriptor.components);
+}
+
+// QA's gate is the authoritative one. It runs the full E2E suite (with the same
+// infra-vs-real discrimination and infra-retry-the-gate logic implement's gate
+// used to have) and then the deterministic coverage check. Order: E2E first
+// (if the app is broken, coverage is moot), then coverage. Both must pass.
+async function runQaGate(ticketId: string, ctx: Ctx): Promise<GateResult> {
+  if (!ctx.descriptor.e2e) {
+    throw new Error(
+      "Product descriptor has no e2e.run command — QA is the authoritative gate " +
+        "and needs one (see .sdlc/product.json)."
+    );
+  }
+
+  // Full E2E, with infra-failures retried HERE, never blamed on the agent.
+  let e2e: GateResult | undefined;
+  for (let attempt = 1; attempt <= MAX_INFRA_RETRIES + 1; attempt++) {
+    e2e = await runE2E(ctx.paths.workdir, ctx.descriptor.e2e.run);
+    if (e2e.kind !== "infra-failure") break;
+    console.log(
+      `E2E infra failure (attempt ${attempt}/${MAX_INFRA_RETRIES + 1}) — harness problem, not code. ` +
+        (attempt <= MAX_INFRA_RETRIES ? "Retrying the gate..." : "Out of retries.")
+    );
+    if (attempt > MAX_INFRA_RETRIES) return e2e;
+  }
+  if (!e2e!.passed) return e2e!; // real-failure: a test genuinely failed
+
+  // Tests pass — now check they cover every acceptance criterion. testDir must
+  // be declared: defaulting to scanning the whole product repo is slow and can
+  // pick up unrelated test files. Fail loudly like the rest of the descriptor
+  // reads, rather than guess.
+  const testDir = ctx.descriptor.e2e.testDir;
+  if (!testDir) {
+    throw new Error(
+      "Product descriptor's e2e block has no testDir — coverage checking needs " +
+        "to know where test files live (see .sdlc/product.json)."
+    );
+  }
+  return checkCoverage(ticketId, resolve(ctx.paths.workdir, testDir));
 }
 
 // The implement stage doesn't fit runStage()'s shape: the agent writes
 // files itself (it gets Read/Edit/Write), rather than returning text for
 // the orchestrator to save, and what gates it isn't a human y/n but a
-// deterministic build check. So it's its own function:
-//   1. switch to an isolated feature branch — never touch main directly
+// deterministic syntax check. So it's its own function:
+//   1. switch to an isolated feature branch in the product repo — never
+//      touch main directly
 //   2. run the implement agent against the approved spec
-//   3. run the build gate from the orchestrator's own process, not the
-//      agent's — the agent has no Bash access at all, because Claude
-//      Code's own Bash sandbox can silently block a tool call
-//      independently of --allowedTools scoping, which once left a real
-//      run with the agent unable to verify itself for reasons it
+//   3. run the implement gate (syntax only) from the orchestrator's own
+//      process, not the agent's — the agent has no Bash access at all,
+//      because Claude Code's own Bash sandbox can silently block a tool
+//      call independently of --allowedTools scoping, which once left a
+//      real run with the agent unable to verify itself for reasons it
 //      couldn't even diagnose. Only the orchestrator's check is trusted.
-//   4. on failure, feed the exact compiler output back to a fresh agent
-//      call and retry, up to MAX_IMPLEMENT_ATTEMPTS, before giving up
-//      and handing the branch to a human
-async function runStageImplement(ticketId: string, mode: StageMode, maxTurns?: number): Promise<void> {
-  const startedAt = Date.now();
-  const branch = ensureBranch(ticketId);
-  const spec = readSpec(ticketId);
+//   4. on a failure, feed the exact syntax-error output back to a fresh
+//      agent call and retry, up to MAX_IMPLEMENT_ATTEMPTS, before giving
+//      up and handing the branch to a human. Behavioral correctness is no
+//      longer implement's gate — that moved to QA (runQaGate), which routes
+//      failures back here via the QA belt (see runStageQa).
 
-  let retry: RetryContext | undefined;
-  let lastBuildOutput = "";
+// seedFeedback lets a caller (the QA belt) start the implement agent off with
+// an explicit reason it's being re-run — e.g. a failing E2E assertion or a
+// NO-SHIP verdict — instead of re-running it blind against the unchanged spec.
+// Without it, the agent has no signal about what to change and tends to
+// reproduce the same code. The current branch already holds its prior work,
+// which it reads, so we don't need to re-supply the old output verbatim.
+async function runStageImplement(
+  ticketId: string,
+  mode: StageMode,
+  ctx: Ctx,
+  maxTurns?: number,
+  seedFeedback?: string
+): Promise<void> {
+  const startedAt = Date.now();
+  const branch = ensureBranch(ticketId, ctx.paths.workdir);
+  const spec = readSpec(ticketId);
+  // Implement reads the product KB too (data shapes, decisions, conventions),
+  // same as spec/review. Read once — the spec doesn't change across attempts.
+  const kb = readKbIndex(ctx.paths.knowledgeDir);
+
+  let retry: RetryContext | undefined = seedFeedback
+    ? { priorAttempt: "Your current implementation is on the feature branch — read it before changing.", feedback: seedFeedback }
+    : undefined;
+  let lastOutput = "";
 
   for (let attempt = 1; attempt <= MAX_IMPLEMENT_ATTEMPTS; attempt++) {
-    const prompt = buildPrompt("agents/implement.md", spec, retry);
+    const prompt = buildPrompt(ctx.paths.workdir, "agents/implement.md", spec, retry, kb);
+
+    emitEvent("stage_started", { ticket: ticketId, stage: "implement", attempt, branch });
+    emitEvent("agent_started", { ticket: ticketId, stage: "implement", kb: { offered: !!kb, dir: kb ? kb.dir : undefined } });
 
     console.log(
       `\nRunning implement agent on ticket ${ticketId} (branch ${branch}, attempt ${attempt}/${MAX_IMPLEMENT_ATTEMPTS})...\n`
     );
-    const report = callAgent(prompt, {
+    const report = await callAgent(prompt, {
+      cwd: ctx.paths.workdir,
       allowedTools: ["Read", "Edit", "Write"],
       maxTurns,
+      addDir: kb ? kb.dir : undefined,
+      ticket: ticketId,
+      stage: "implement",
     });
 
     console.log("----- implement agent report -----\n");
     console.log(report);
     console.log("\n-------------------------------\n");
 
-    console.log("Checking build gate (npm run build)...");
-    const { passed, output } = await runBuild();
-    lastBuildOutput = output;
+    console.log(`Running the implement gate (syntax checks) in ${ctx.paths.workdir}...`);
+    const gate = await runImplementGate(ctx);
+    lastOutput = gate.output;
 
     logRun({
       stage: "implement",
@@ -357,21 +780,29 @@ async function runStageImplement(ticketId: string, mode: StageMode, maxTurns?: n
       branch,
       attempt,
       durationMs: Date.now() - startedAt,
-      approved: passed,
+      approved: gate.passed,
+      gateKind: gate.kind,
     });
+    emitEvent("gate_result", { ticket: ticketId, stage: "implement", source: gate.source, kind: gate.kind, passed: gate.passed, attempt });
 
-    if (passed) {
-      console.log(`Build gate passed on branch ${branch} (attempt ${attempt}/${MAX_IMPLEMENT_ATTEMPTS}).`);
+    if (gate.passed) {
+      console.log(`Syntax gate passed on branch ${branch} (attempt ${attempt}/${MAX_IMPLEMENT_ATTEMPTS}).`);
+      emitEvent("stage_finished", { ticket: ticketId, stage: "implement", approved: true, durationMs: Date.now() - startedAt, attempt });
       return;
     }
 
-    console.log(`Build gate failed on attempt ${attempt}/${MAX_IMPLEMENT_ATTEMPTS}.`);
-    retry = { priorAttempt: report, feedback: `\`npm run build\` failed with:\n${output}` };
+    // The implement gate is syntax-only now, so a failure is always a
+    // real-failure (broken code the agent should fix) — there is no
+    // infra-failure path here, since nothing stands up the app. Authoritative
+    // behavioral verification (which CAN infra-fail) lives in QA.
+    console.log(`Syntax gate failed on attempt ${attempt}/${MAX_IMPLEMENT_ATTEMPTS}.`);
+    retry = { priorAttempt: report, feedback: `Syntax check failed with:\n${gate.output}` };
   }
 
+  emitEvent("stage_finished", { ticket: ticketId, stage: "implement", approved: false, reason: "exhausted", attempt: MAX_IMPLEMENT_ATTEMPTS, durationMs: Date.now() - startedAt });
   throw new Error(
-    `Build gate failed for ticket ${ticketId} on branch ${branch} after ${MAX_IMPLEMENT_ATTEMPTS} attempts.\n` +
-      `Last build output:\n${lastBuildOutput}\n` +
+    `Syntax gate failed for ticket ${ticketId} on branch ${branch} after ${MAX_IMPLEMENT_ATTEMPTS} attempts.\n` +
+      `Last output:\n${lastOutput}\n` +
       "Inspect the branch — the pipeline does not retry further."
   );
 }
@@ -381,57 +812,478 @@ function writeReview(ticketId: string, output: string): void {
   writeFileSync(`reviews/${ticketId}.md`, output);
 }
 
-function runStageReview(ticketId: string, mode: StageMode): Promise<void> {
-  return runStage({
-    stage: "review",
-    ticketId,
-    mode,
-    roleFile: "agents/review.md",
-    getInput: () => readSpec(ticketId),
-    allowedTools: ["Read"],
-    onApprove: (output) => writeReview(ticketId, output),
-  });
+function runStageReview(ticketId: string, mode: StageMode, ctx: Ctx): Promise<void> {
+  return runStage(
+    {
+      stage: "review",
+      ticketId,
+      mode,
+      roleFile: "agents/review.md",
+      getInput: () => readSpec(ticketId),
+      allowedTools: ["Read"],
+      usesKb: true,
+      onApprove: (output) => writeReview(ticketId, output),
+    },
+    ctx
+  );
 }
 
 // The test agent writes test/*.test.ts itself (it gets Read/Edit/Write),
 // so there's nothing for the orchestrator to save on approval — same
 // reason implement's agent call has no onApprove-driven save either, just
-// without implement's build-gate loop, since a failing test suite here
+// without implement's checks-gate loop, since a failing test suite here
 // isn't the test agent's fault to fix (that's a review/implement problem).
-function runStageTest(ticketId: string, mode: StageMode): Promise<void> {
-  return runStage({
-    stage: "test",
-    ticketId,
-    mode,
-    roleFile: "agents/test.md",
-    getInput: () => readSpec(ticketId),
-    allowedTools: ["Read", "Edit", "Write"],
-    onApprove: () => {},
+// seedFeedback lets the QA belt re-run the test stage with an explicit
+// coverage gap to close (which AC-N lack a live tagged test), rather than
+// blind. A coverage failure is the test stage's to fix — never implement's —
+// because COVERS tags and E2E scenarios are the test agent's output.
+function runStageTest(ticketId: string, mode: StageMode, ctx: Ctx, seedFeedback?: string): Promise<void> {
+  return runStage(
+    {
+      stage: "test",
+      ticketId,
+      mode,
+      roleFile: "agents/test.md",
+      getInput: () => readSpec(ticketId),
+      allowedTools: ["Read", "Edit", "Write"],
+      onApprove: () => {},
+    },
+    ctx,
+    seedFeedback
+      ? { priorAttempt: "Your current tests are on the feature branch — read them before changing.", feedback: seedFeedback }
+      : undefined
+  );
+}
+
+// Writes the QA agent's narrative report to qa/<id>.md in the PIPELINE repo.
+// The agent returns text (like review/spec); the orchestrator writes the file.
+// Determinism boundary: checkQaVerdict later reads a file the model never wrote.
+function writeQaReport(ticketId: string, output: string): void {
+  mkdirSync("qa", { recursive: true });
+  writeFileSync(`qa/${ticketId}.md`, output);
+}
+
+// QA is the authoritative gate stage. It does not fit runStage (its gate is a
+// script, not a human y/n) or runStageImplement (a QA failure isn't QA's own to
+// fix). Flow per attempt:
+//   1. run the qa agent read-only; it writes a SHIP/NO-SHIP report as text
+//   2. orchestrator writes qa/<id>.md from that text
+//   3. checkQaVerdict (script) reads the verdict
+//   4. runQaGate (script) runs the full E2E suite + coverage check
+//   5. if all pass -> done. If any fail -> ROUTE BY FAILURE TYPE to the stage
+//      that owns the fix, re-run QA, capped at MAX_QA_ATTEMPTS, then hand to a
+//      human.
+//
+// The routing is the point. A failing E2E test or a NO-SHIP verdict means the
+// CODE doesn't meet a criterion -> re-run IMPLEMENT (with the failure threaded
+// in) to fix the code. A coverage gap means a test is MISSING -> re-run TEST
+// (told which AC-N) to ADD it. A failing test is never routed back to the test
+// agent "to make it pass" — that would invite weakening the test to go green;
+// a red test is always the code's problem, and if the code genuinely can't
+// satisfy it, implement exhausts its attempts and a human is summoned with the
+// test still honest.
+async function runStageQa(ticketId: string, mode: StageMode, ctx: Ctx): Promise<void> {
+  for (let attempt = 1; attempt <= MAX_QA_ATTEMPTS; attempt++) {
+    const startedAt = Date.now();
+    const spec = readSpec(ticketId);
+    const prompt = buildPrompt(ctx.paths.workdir, "agents/qa.md", spec);
+
+    emitEvent("stage_started", { ticket: ticketId, stage: "qa", attempt });
+    emitEvent("agent_started", { ticket: ticketId, stage: "qa", kb: { offered: false } });
+
+    console.log(`\nRunning qa agent on ticket ${ticketId} (attempt ${attempt}/${MAX_QA_ATTEMPTS})...\n`);
+    const report = await callAgent(prompt, { cwd: ctx.paths.workdir, allowedTools: ["Read"], ticket: ticketId, stage: "qa" });
+
+    console.log(`----- qa agent report -----\n`);
+    console.log(report);
+    console.log("\n-------------------------------\n");
+
+    writeQaReport(ticketId, report);
+
+    // Two dumb scripts decide, in order: the agent's own verdict, then the
+    // authoritative gate (full E2E + coverage). Both must pass.
+    const verdict = checkQaVerdict(ticketId);
+    const gate = verdict.passed ? await runQaGate(ticketId, ctx) : verdict;
+
+    logRun({
+      stage: "qa",
+      ticket: ticketId,
+      mode,
+      attempt,
+      durationMs: Date.now() - startedAt,
+      approved: gate.passed,
+      gateKind: gate.kind,
+      gateSource: gate.source,
+    });
+    emitEvent("gate_result", { ticket: ticketId, stage: "qa", source: gate.source, kind: gate.kind, passed: gate.passed, attempt });
+
+    if (gate.passed) {
+      console.log(`QA passed (verdict SHIP, full suite green, coverage complete).`);
+      emitEvent("stage_finished", { ticket: ticketId, stage: "qa", approved: true, durationMs: Date.now() - startedAt, attempt });
+      return;
+    }
+
+    // An infra-failure from the QA gate is an environment problem, not the
+    // code's fault — stop for a human rather than belt the agent.
+    if (gate.kind === "infra-failure") {
+      emitEvent("stage_finished", { ticket: ticketId, stage: "qa", approved: false, reason: "infra-failure", attempt });
+      throw new Error(
+        `QA E2E infra failure for ticket ${ticketId}: the harness didn't come up ` +
+          `(PocketBase/port/setup), not the code.\n\n${gate.output}`
+      );
+    }
+
+    if (attempt >= MAX_QA_ATTEMPTS) break;
+
+    if (gate.source === "coverage") {
+      // A test is MISSING — the test stage owns this, not implement.
+      console.log(`QA coverage gap. Re-running the TEST stage to add the missing tagged test(s).`);
+      emitEvent("belt_route", { ticket: ticketId, from: "qa", to: "test", reason: "coverage", attempt });
+      await runStageTest(
+        ticketId,
+        ctx.config.stages.test?.mode ?? "auto",
+        ctx,
+        `The QA coverage gate rejected the current tests:\n${gate.output}\n\n` +
+          `Add or fix E2E scenarios so every listed acceptance criterion has a LIVE (non-skipped) ` +
+          `test tagged "// COVERS: <AC-N>". Do NOT weaken, skip, or delete existing tests to pass.`
+      );
+    } else {
+      // A failing E2E test or a NO-SHIP verdict — the CODE is wrong, so route
+      // to implement with the specifics. For an E2E failure the failing
+      // assertions are the most useful feedback; for a verdict rejection the
+      // QA report's FAIL rows are.
+      const feedback =
+        gate.source === "verdict"
+          ? `The QA judge rejected the implementation. QA report:\n${readFileSync(`qa/${ticketId}.md`, "utf8")}`
+          : `The QA end-to-end suite failed. Fix the code so these pass (do not change the tests):\n${gate.output}`;
+      console.log(`QA ${gate.source} failure. Re-running the IMPLEMENT stage with the failure details.`);
+      emitEvent("belt_route", { ticket: ticketId, from: "qa", to: "implement", reason: gate.source, attempt });
+      await runStageImplement(
+        ticketId,
+        ctx.config.stages.implement?.mode ?? "auto",
+        ctx,
+        ctx.config.stages.implement?.maxTurns,
+        feedback
+      );
+    }
+  }
+
+  emitEvent("stage_finished", { ticket: ticketId, stage: "qa", approved: false, reason: "exhausted", attempt: MAX_QA_ATTEMPTS });
+  throw new Error(
+    `QA failed for ticket ${ticketId} after ${MAX_QA_ATTEMPTS} attempts. ` +
+      `Last verdict/gate output in qa/${ticketId}.md. Inspect the branch — ` +
+      `the pipeline does not retry further.`
+  );
+}
+
+// ---- Retrospector: per-ticket aggregation (first step of the learning loop) ----
+
+// This ticket's runlog entries as the factual record of what happened — every
+// stage attempt, gate result, retry count, and rejection feedback. This is the
+// Retrospector's most valuable signal: a clean first-pass ticket teaches
+// little; a ticket that belted the QA gate twice teaches a lot.
+function readTicketRunlog(ticketId: string): string {
+  const entries = readRunlog().filter((e) => e.ticket === ticketId);
+  return entries.map((e) => JSON.stringify(e)).join("\n");
+}
+
+// Gathers this ticket's runlog slice + its artifacts into one input blob. The
+// artifacts live in THIS repo (the handoff protocol), so they're read
+// pipeline-local, not from the product repo.
+function gatherRetroInput(ticketId: string): string {
+  const parts: string[] = [];
+  parts.push("## Runlog\n" + readTicketRunlog(ticketId));
+  for (const [label, path] of [
+    ["Ticket", `tickets/${ticketId}.md`],
+    ["Spec", `specs/${ticketId}.md`],
+    ["Review", `reviews/${ticketId}.md`],
+    ["QA report", `qa/${ticketId}.md`],
+  ] as const) {
+    if (existsSync(path)) parts.push(`## ${label}\n` + readFileSync(path, "utf8"));
+  }
+  return parts.join("\n\n---\n\n");
+}
+
+function writeRetroSummary(ticketId: string, output: string): void {
+  mkdirSync("retros", { recursive: true });
+  writeFileSync(`retros/${ticketId}.md`, output);
+}
+
+// Per-ticket aggregation. Read-only and product-agnostic: it REPORTS what
+// happened; it does not touch code or any KB and gates nothing. Its summary is
+// advisory input to the Curator (added next). Runs after the writing flow
+// completes, gated by config.learning.enabled. Logged as its own stage but
+// NOT part of STAGE_ORDER, so it never affects auto-resume.
+async function runStageRetrospector(ticketId: string, ctx: Ctx): Promise<void> {
+  const startedAt = Date.now();
+  const input = gatherRetroInput(ticketId);
+  const prompt = buildPrompt(ctx.paths.workdir, "agents/retrospector.md", input);
+
+  emitEvent("stage_started", { ticket: ticketId, stage: "retrospector" });
+  emitEvent("agent_started", { ticket: ticketId, stage: "retrospector", kb: { offered: false } });
+
+  console.log(`\nRunning retrospector on ticket ${ticketId}...\n`);
+  const summary = await callAgent(prompt, { cwd: ctx.paths.workdir, allowedTools: ["Read"], ticket: ticketId, stage: "retrospector" });
+
+  console.log("----- retrospector summary -----\n");
+  console.log(summary);
+  console.log("\n-------------------------------\n");
+
+  writeRetroSummary(ticketId, summary);
+  logRun({
+    stage: "retrospector",
+    ticket: ticketId,
+    durationMs: Date.now() - startedAt,
+    approved: true, // aggregation always "succeeds" — it produces a summary
   });
+  emitEvent("stage_finished", { ticket: ticketId, stage: "retrospector", approved: true, durationMs: Date.now() - startedAt });
+  console.log(`Retrospective written to retros/${ticketId}.md.`);
+}
+
+// ---- Curator: proposes conformance-checked KB updates as a pushed branch ----
+
+// Cap on the Curator's shape-fix belt: it drafts a proposal, the conformance
+// script gates SHAPE, and on failure the violations are fed back once. Bounded
+// like the other belts so a persistently malformed proposal can't loop forever.
+const MAX_CURATOR_ATTEMPTS = 2;
+
+// Thin git wrapper for KB-repo operations. git is a real .exe (not a .cmd
+// shim), so the args-array form is safe — no shell:true, no DEP0190, same as
+// ensureBranch.
+function runGit(cwd: string, args: string[]): { ok: boolean; stdout: string; stderr: string } {
+  const r = spawnSync("git", args, { cwd, encoding: "utf8" });
+  return { ok: r.status === 0, stdout: (r.stdout ?? "").trim(), stderr: (r.stderr ?? "").trim() };
+}
+
+// Parses the Curator's proposal into (bundle-relative path, content) blocks.
+// The agent emits blocks delimited EXACTLY as:
+//   ===FILE: decisions/foo.md===
+//   <content>
+//   ===END===
+// Paths are validated bundle-relative (no absolute, no drive letter, no ".."),
+// so a proposal can never write outside the KB repo.
+function parseProposalFiles(proposal: string): Array<{ path: string; content: string }> {
+  const files: Array<{ path: string; content: string }> = [];
+  const re = /===FILE:[ \t]*(.+?)[ \t]*===\r?\n([\s\S]*?)\r?\n===END===/g;
+  let m: RegExpExecArray | null;
+  while ((m = re.exec(proposal)) !== null) {
+    const path = m[1].trim().replace(/\\/g, "/");
+    if (!path || path.startsWith("/") || /^[A-Za-z]:/.test(path) || path.split("/").includes("..")) {
+      console.log(`Curator: ignoring unsafe proposal path "${m[1].trim()}".`);
+      continue;
+    }
+    files.push({ path, content: m[2] });
+  }
+  return files;
+}
+
+// Cuts a fresh branch in the KB repo, writes the proposed files, and commits.
+// Returns the branch the repo was on before, so a failed attempt can be undone
+// and the repo left as we found it.
+function applyProposalToBranch(
+  kbDir: string,
+  branch: string,
+  files: Array<{ path: string; content: string }>,
+  ticketId: string
+): string {
+  const head = runGit(kbDir, ["rev-parse", "--abbrev-ref", "HEAD"]);
+  if (!head.ok) throw new Error(`KB repo: cannot read current branch: ${head.stderr}`);
+  const original = head.stdout;
+
+  const co = runGit(kbDir, ["checkout", "-b", branch]);
+  if (!co.ok) throw new Error(`KB repo: cannot create branch ${branch}: ${co.stderr}`);
+
+  for (const f of files) {
+    const target = resolve(kbDir, f.path);
+    mkdirSync(resolve(target, ".."), { recursive: true });
+    writeFileSync(target, f.content);
+  }
+
+  runGit(kbDir, ["add", "-A"]);
+  const commit = runGit(kbDir, ["commit", "-m", `KB update from ticket ${ticketId}`]);
+  if (!commit.ok) {
+    runGit(kbDir, ["checkout", original]);
+    runGit(kbDir, ["branch", "-D", branch]);
+    throw new Error(`KB repo: commit failed on ${branch}: ${commit.stderr || commit.stdout}`);
+  }
+  return original;
+}
+
+// Discards a failed attempt's branch and returns to the original branch.
+function resetBranch(kbDir: string, original: string, branch: string): void {
+  runGit(kbDir, ["checkout", original]);
+  runGit(kbDir, ["branch", "-D", branch]);
+}
+
+// The Curator: sole writer to a KB, deliberately picky, never writes directly.
+// It reads the KB's own CONVENTIONS + current index + the Retrospector summary
+// and proposes either "NO CHANGE" or conformance-checked concept files. The
+// ORCHESTRATOR (not the agent) writes those into a KB branch, runs the shape
+// gate, and — on pass — pushes the branch for a human to PR/merge (the real,
+// human, KB-write gate). On a shape failure the violations are fed back once
+// (bounded belt). `which` is future-proofed for a second (pipeline) KB; only
+// "product" (-> knowledgeDir / OKF) is wired today.
+async function runCurator(ticketId: string, ctx: Ctx, which: "product"): Promise<void> {
+  const kbDir = ctx.paths.knowledgeDir;
+  if (!kbDir || !existsSync(kbDir)) {
+    console.log(`Skipping ${which} curator (no KB at ${kbDir}).`);
+    return;
+  }
+  const retroPath = `retros/${ticketId}.md`;
+  if (!existsSync(retroPath)) {
+    console.log(`Skipping ${which} curator (no retrospective at ${retroPath}).`);
+    return;
+  }
+
+  // Never fight the KB repo's working tree: uncommitted changes there could get
+  // entangled by our branch/commit. Bail cleanly for a human instead.
+  const status = runGit(kbDir, ["status", "--porcelain"]);
+  if (!status.ok) {
+    console.log(`Skipping ${which} curator: cannot read KB git status (${status.stderr}).`);
+    return;
+  }
+  if (status.stdout.length > 0) {
+    console.log(`Skipping ${which} curator: KB repo ${kbDir} has uncommitted changes — commit or stash them first.`);
+    return;
+  }
+
+  const bundleRoot = kbDir; // OKF: the bundle root IS the repo root (no bundle/ subdir).
+  const spec = PRODUCT_KB_SPEC;
+  const conventions = existsSync(`${kbDir}/CONVENTIONS.md`) ? readFileSync(`${kbDir}/CONVENTIONS.md`, "utf8") : "";
+  const indexText = existsSync(`${bundleRoot}/index.md`) ? readFileSync(`${bundleRoot}/index.md`, "utf8") : "(empty KB)";
+  const summary = readFileSync(retroPath, "utf8");
+
+  const input = [
+    "## CONVENTIONS (follow these EXACTLY — they govern both shape and judgment)\n" + conventions,
+    "## Current KB index\n" + indexText,
+    "## Retrospector summary (the ticket to consider)\n" + summary,
+  ].join("\n\n---\n\n");
+
+  const startedAt = Date.now();
+  const branchBase = `kb/${ticketId}-${startedAt}`;
+  let retry: RetryContext | undefined;
+
+  const stage = `curator-${which}`;
+  for (let attempt = 1; attempt <= MAX_CURATOR_ATTEMPTS; attempt++) {
+    const prompt = buildPrompt(ctx.paths.workdir, "agents/curator.md", input, retry);
+    emitEvent("stage_started", { ticket: ticketId, stage, attempt });
+    emitEvent("agent_started", { ticket: ticketId, stage, kb: { offered: true, dir: kbDir } });
+    console.log(`\nRunning ${which} curator on ticket ${ticketId} (attempt ${attempt}/${MAX_CURATOR_ATTEMPTS})...\n`);
+    // Read-only + a readable root into the KB so it can inspect existing
+    // concepts (update-over-duplicate). It PROPOSES file text; it never writes.
+    const proposal = await callAgent(prompt, { cwd: ctx.paths.workdir, allowedTools: ["Read"], addDir: kbDir, ticket: ticketId, stage });
+
+    console.log("----- curator proposal -----\n");
+    console.log(proposal);
+    console.log("\n----------------------------\n");
+
+    if (/^\s*NO CHANGE\b/i.test(proposal)) {
+      console.log(`Curator (${which}): no change proposed.`);
+      logRun({ stage, ticket: ticketId, durationMs: Date.now() - startedAt, approved: true, change: false });
+      emitEvent("stage_finished", { ticket: ticketId, stage, approved: true, change: false, durationMs: Date.now() - startedAt });
+      return;
+    }
+
+    const files = parseProposalFiles(proposal);
+    if (files.length === 0) {
+      const fb =
+        "Your response was neither a line starting with 'NO CHANGE' nor any " +
+        "===FILE: <path>=== ... ===END=== blocks. Emit exactly one of those two forms.";
+      if (attempt >= MAX_CURATOR_ATTEMPTS) {
+        console.log(`Curator (${which}) produced no usable file blocks; skipping.`);
+        logRun({ stage, ticket: ticketId, durationMs: Date.now() - startedAt, approved: false, change: false });
+        emitEvent("stage_finished", { ticket: ticketId, stage, approved: false, change: false, durationMs: Date.now() - startedAt });
+        return;
+      }
+      retry = { priorAttempt: proposal, feedback: fb };
+      continue;
+    }
+
+    const branch = `${branchBase}-a${attempt}`;
+    const original = applyProposalToBranch(kbDir, branch, files, ticketId);
+
+    const conformance = checkBundle(bundleRoot, spec);
+    emitEvent("gate_result", { ticket: ticketId, stage, source: "conformance", kind: conformance.passed ? "pass" : "real-failure", passed: conformance.passed, attempt });
+    if (!conformance.passed) {
+      const violations = conformance.violations.map((v) => `  [${v.rule}] ${v.file}: ${v.detail}`).join("\n");
+      console.log(`Curator (${which}) conformance FAILED:\n${violations}`);
+      resetBranch(kbDir, original, branch);
+      if (attempt >= MAX_CURATOR_ATTEMPTS) {
+        console.log(`Curator (${which}) could not produce conformant output after ${attempt} attempts; skipping (no push).`);
+        logRun({ stage, ticket: ticketId, durationMs: Date.now() - startedAt, approved: false, change: false });
+        emitEvent("stage_finished", { ticket: ticketId, stage, approved: false, change: false, durationMs: Date.now() - startedAt });
+        return;
+      }
+      retry = {
+        priorAttempt: proposal,
+        feedback: `The KB conformance (shape) check rejected your proposal:\n${violations}\n\nFix exactly these and re-emit the file blocks.`,
+      };
+      continue;
+    }
+
+    // Shape is valid — push the branch, then restore the repo to its original
+    // branch so we leave it as we found it. The human opens the PR (real gate).
+    const push = runGit(kbDir, ["push", "-u", "origin", branch]);
+    runGit(kbDir, ["checkout", original]);
+    if (!push.ok) {
+      console.log(`Curator (${which}): conformant branch ${branch} committed locally but push failed: ${push.stderr}`);
+      logRun({ stage, ticket: ticketId, durationMs: Date.now() - startedAt, approved: true, change: true, branch, pushed: false });
+      emitEvent("stage_finished", { ticket: ticketId, stage, approved: true, change: true, branch, pushed: false, durationMs: Date.now() - startedAt });
+      return;
+    }
+    console.log(`Curator (${which}): pushed branch ${branch} to origin — open a PR to review/merge.`);
+    logRun({ stage, ticket: ticketId, durationMs: Date.now() - startedAt, approved: true, change: true, branch, pushed: true });
+    emitEvent("stage_finished", { ticket: ticketId, stage, approved: true, change: true, branch, pushed: true, durationMs: Date.now() - startedAt });
+    return;
+  }
 }
 
 // Runs one named stage if it's configured in sdlc.config.json, skipping
 // it (with a note) otherwise — same behavior main() already had per
 // stage, just centralized so main() can loop over STAGE_ORDER instead of
 // repeating this if-block three times.
-async function runNamedStage(stage: Stage, ticketId: string, config: Config): Promise<void> {
-  const stageConfig = config.stages[stage];
+async function runNamedStage(stage: Stage, ticketId: string, ctx: Ctx): Promise<void> {
+  const stageConfig = ctx.config.stages[stage];
   if (!stageConfig) {
     console.log(`Skipping ${stage} (not configured in sdlc.config.json).`);
     return;
   }
 
-  switch (stage) {
-    case "parse":
-      return runStageParse(ticketId, stageConfig.mode);
-    case "spec":
-      return runStageSpec(ticketId, stageConfig.mode);
-    case "implement":
-      return runStageImplement(ticketId, stageConfig.mode, stageConfig.maxTurns);
-    case "review":
-      return runStageReview(ticketId, stageConfig.mode);
-    case "test":
-      return runStageTest(ticketId, stageConfig.mode);
+  try {
+    switch (stage) {
+      case "parse":
+        await runStageParse(ticketId, stageConfig.mode, ctx);
+        return;
+      case "spec":
+        await runStageSpec(ticketId, stageConfig.mode, ctx);
+        return;
+      case "implement":
+        await runStageImplement(ticketId, stageConfig.mode, ctx, stageConfig.maxTurns);
+        return;
+      case "review":
+        await runStageReview(ticketId, stageConfig.mode, ctx);
+        return;
+      case "test":
+        await runStageTest(ticketId, stageConfig.mode, ctx);
+        return;
+      case "qa":
+        await runStageQa(ticketId, stageConfig.mode, ctx);
+        return;
+    }
+  } catch (err) {
+    // A stage that emitted stage_started but then threw before its own
+    // stage_finished — e.g. callAgent rejecting on timeout / non-zero CLI exit
+    // — would otherwise leave that lane "running" forever in a tailing UI
+    // (run_finished is stage-agnostic). Emit a terminal event so the UI can
+    // close the lane, then rethrow to preserve the pipeline's fail-stop.
+    emitEvent("stage_finished", {
+      ticket: ticketId,
+      stage,
+      approved: false,
+      reason: "error",
+      error: err instanceof Error ? err.message : String(err),
+    });
+    throw err;
   }
 }
 
@@ -465,6 +1317,14 @@ async function main(): Promise<void> {
     throw new Error("sdlc.config.json is missing a 'parse' stage entry");
   }
 
+  const paths = resolvePaths(config);
+  const descriptor = readProductDescriptor(paths.workdir);
+  const ctx: Ctx = { config, paths, descriptor };
+
+  console.log(`\nTicket ${ticketId}`);
+  console.log(`  Product:       ${descriptor.name} at ${paths.workdir}`);
+  console.log(`  Knowledge repo: ${paths.knowledgeDir} (validated, not yet written)`);
+
   const startStage = (overrideStage as Stage) ?? resolveStartStage(ticketId);
   if (overrideStage) {
     console.log(`Forcing ticket ${ticketId} to start at stage "${startStage}" (explicit override).`);
@@ -472,10 +1332,36 @@ async function main(): Promise<void> {
     console.log(`Resuming ticket ${ticketId} from stage "${startStage}" (per runlog.jsonl).`);
   }
 
-  const startIndex = STAGE_ORDER.indexOf(startStage);
-  for (let i = startIndex; i < STAGE_ORDER.length; i++) {
-    await runNamedStage(STAGE_ORDER[i], ticketId, config);
+  emitEvent("run_started", {
+    ticket: ticketId,
+    product: descriptor.name,
+    knowledgeDir: paths.knowledgeDir,
+    startStage,
+    stages: [...STAGE_ORDER],
+    learning: !!ctx.config.learning?.enabled,
+  });
+
+  try {
+    const startIndex = STAGE_ORDER.indexOf(startStage);
+    for (let i = startIndex; i < STAGE_ORDER.length; i++) {
+      await runNamedStage(STAGE_ORDER[i], ticketId, ctx);
+    }
+
+    // The learning loop runs after the writing flow completes for this ticket.
+    // The Retrospector aggregates what happened; the product Curator then judges
+    // it against the KB's conventions and proposes a conformance-checked branch
+    // for a human PR. Gated by config so the writing flow runs standalone. The
+    // pipeline Curator (a second KB) is deferred until that repo exists.
+    if (ctx.config.learning?.enabled) {
+      await runStageRetrospector(ticketId, ctx);
+      await runCurator(ticketId, ctx, "product");
+    }
+  } catch (err) {
+    emitEvent("run_finished", { ticket: ticketId, outcome: "failed", error: err instanceof Error ? err.message : String(err) });
+    throw err;
   }
+
+  emitEvent("run_finished", { ticket: ticketId, outcome: "complete" });
 }
 
 main().catch((err) => {

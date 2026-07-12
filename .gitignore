@@ -3,3 +3,15 @@ dist/
 *.log
 .env
 .claude/settings.local.json
+
+# Per-run pipeline artifacts + telemetry. Generated when the pipeline runs
+# against a product (tickets and every agent's output), so they belong to a
+# run, not to this fork-per-project template. events.jsonl is the live UI
+# telemetry stream; runlog.jsonl is intentionally NOT ignored (it's the durable
+# resume state the orchestrator reads on restart).
+/tickets/
+/specs/
+/reviews/
+/qa/
+/retros/
+/events.jsonl

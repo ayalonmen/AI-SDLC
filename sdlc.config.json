@@ -1,11 +1,16 @@
 {
-  "_comment": "The autonomy dial. Each stage's mode is one of: 'manual' (you do it yourself), 'approve' (agent produces the artifact, pipeline pauses for your y/n), or 'auto' (agent runs, pipeline continues without asking). Session 1 only wires up 'parse' — later sessions add spec/implement/review/test, and QA + deploy stay hard gates that are never configurable to auto.",
+  "_comment": "Autonomy dial per stage. mode is one of: 'approve' (agent produces its artifact, pipeline pauses for your y/n before saving; on reject it re-runs with your feedback), 'auto' (agent runs, pipeline continues without asking), or 'manual' (you do the stage yourself). mode governs the human pause for the text-producing stages (parse, spec, review). The gated stages run a deterministic orchestrator-side check regardless of mode: implement is gated by the product's syntax check, and qa by the full E2E suite + acceptance-criteria (AC-N) coverage. So qa is effectively a hard gate that mode cannot disable — 'auto' there only means 'do not pause for a human before the gate runs'. Deploy (not yet a stage) will likewise be a hard, non-configurable gate.",
+  "project": {
+    "productPath": "../Homebase",
+    "knowledgePath": "../OKF"
+  },
   "stages": {
     "parse":     { "mode": "approve" },
     "spec":      { "mode": "approve" },
     "implement": { "mode": "auto", "maxTurns": 30 },
     "review":    { "mode": "auto" },
     "test":      { "mode": "auto" },
-    "qa":        { "mode": "gate" }
-  }
+    "qa":        { "mode": "auto" }
+  },
+  "learning": { "enabled": false }
 }
