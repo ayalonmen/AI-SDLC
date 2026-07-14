@@ -55,12 +55,15 @@ deterministic step, not a stage). Order and the auto-resume logic both walk
   product's deterministic `check` (syntax only). Self-corrects against
   syntax up to a cap.
 - **review** — reads the spec + code, writes findings to `reviews/<id>.md`.
+  A hard gate: the deterministic `checkReview` scans for `[BLOCKER]` bullets;
+  any blocker belts back to implement (bounded), then a human.
 - **test** — writes E2E scenarios in the product repo, each tagged
   `// COVERS: AC-N`.
-- **qa** — the authoritative gate. The qa agent writes a SHIP/NO-SHIP report
-  (`qa/<id>.md`); then two deterministic scripts decide: `checkQaVerdict`
-  (reads the verdict) and `runQaGate` (full E2E suite + `checkCoverage`,
-  which requires every `AC-N` to have a live covering test).
+- **qa** — the authoritative gate, now fully deterministic (no agent). The
+  orchestrator writes a `qa/<id>.md` summary, then `runQaGate` decides: the
+  full E2E suite, plus `checkCoverage` (every `AC-N` needs a live covering
+  test) *only when the `test` stage is enabled* — with `test` off, QA gates on
+  E2E alone.
 
 ## Conventions
 
@@ -69,13 +72,15 @@ deterministic step, not a stage). Order and the auto-resume logic both walk
   the product repo, on the feature branch.
 - **Model proposes, script decides.** Agents never gate themselves: the
   orchestrator runs the checks (agents have no Bash access at all, since
-  Claude Code's sandbox can silently block a tool call). `checkQaVerdict`
+  Claude Code's sandbox can silently block a tool call). `checkReview`
   and `checkCoverage` read files the model was not allowed to write.
-- **Gate failures route to the stage that owns the fix.** A failing test or
-  NO-SHIP verdict → implement (fix the code, with the failure threaded in).
-  A coverage gap → test (add the missing tagged test). A failing test is
-  never routed back to "make it pass". An infra-failure (harness didn't come
-  up) retries the gate, never an agent, then escalates to a human.
+- **Gate failures route to the stage that owns the fix.** A failing E2E test
+  or a `[BLOCKER]` review finding → implement (fix the code, with the failure
+  threaded in). A coverage gap → test (add the missing tagged test). A failing
+  test is never routed back to "make it pass". An infra-failure (harness didn't
+  come up) retries the gate, never an agent, then escalates to a human. Each
+  belt is bounded, and a belt to a disabled stage (`enabled:false`) stops for a
+  human instead.
 - **Role prompts stay generic.** Anything product-specific comes from the
   product's own `CLAUDE.md` (loaded per run) and its `.sdlc/product.json` —
   never hardcode a product's stack, file layout, or domain into `agents/*`.

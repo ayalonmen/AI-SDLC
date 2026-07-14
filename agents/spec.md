@@ -42,7 +42,7 @@ Produce ONLY a markdown spec with these sections, no preamble:
 (A short table: each acceptance criterion, BY ITS AC-N ID (AC-1, AC-2, …
  exactly as the ticket assigned them) -> which function/rule satisfies it.
  This proves the spec covers the contract, and carries the AC-N IDs forward
- so the test and QA stages can key their coverage and verdict to them.)
+ so the test and QA stages can key their coverage to them.)
 
 # Rules
 - Every acceptance criterion must map to something in the spec.

@@ -25,8 +25,9 @@ Tag every test with the acceptance-criteria IDs it covers, using a comment
 of the exact form `// COVERS: AC-1` (or `// COVERS: AC-1, AC-3` for a test
 that covers several). This tag is not decorative: a deterministic coverage
 gate scans your test files for these tags and FAILS the ticket if any AC-N
-from the ticket has no covering test. Use the exact IDs the ticket assigned
-— matching is literal.
+from the ticket has no covering test (this coverage gate is active only while
+the test stage is enabled — the stage you are running now). Use the exact IDs
+the ticket assigned — matching is literal.
 
 # Rules
 - Cover every acceptance criterion with at least one scenario, and tag each

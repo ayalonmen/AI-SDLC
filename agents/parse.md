@@ -46,8 +46,9 @@ A single markdown block with exactly these sections:
    could pass or fail against it (e.g. "AC-1: SMA(20) must have 20 bars of
    warmup before it can signal a crossover", not "moving averages should
    work"). These IDs are load-bearing: downstream stages tag each test with
-   the criteria it covers (`// COVERS: AC-1`), and a deterministic gate
-   fails the ticket if any AC-N has no covering test. So give every
+   the criteria it covers (`// COVERS: AC-1`), and — when the test stage is
+   enabled — a deterministic gate fails the ticket if any AC-N has no covering
+   test. So give every
    criterion exactly one stable ID, never reuse or renumber an existing ID
    on a re-run, and keep them contiguous (AC-1, AC-2, …).
 3. **Decisions made to resolve ambiguity** — anything you had to assume

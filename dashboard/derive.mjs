@@ -23,7 +23,7 @@ export const STAGES = [
   { key: "parse", label: "Parse", gate: "auto" },
   { key: "spec", label: "Spec", gate: "soft" },
   { key: "implement", label: "Implement", gate: "auto" },
-  { key: "review", label: "Review", gate: "soft" },
+  { key: "review", label: "Review", gate: "hard" },
   { key: "test", label: "Test", gate: "auto" },
   { key: "qa", label: "QA Gate", gate: "hard" },
   { key: "deploy", label: "Deploy", gate: "hard", planned: true },
@@ -129,9 +129,9 @@ function deriveTicket(id, runlog, events, meta, now) {
     if (skipped && state === "todo") state = "skipped";
     if (st.planned) state = "planned"; // Deploy is never real yet
 
-    // Gate detail for this stage (implement=syntax, qa=verdict/e2e/coverage).
+    // Gate detail for this stage (implement=syntax, review=blocker, qa=e2e/coverage).
     let gateKind = null, gateSource = null;
-    if (lastRl && (st.key === "implement" || st.key === "qa")) {
+    if (lastRl && (st.key === "implement" || st.key === "review" || st.key === "qa")) {
       gateKind = lastRl.gateKind ?? null;
       gateSource = lastRl.gateSource ?? (st.key === "implement" ? "checks" : null);
     }
@@ -268,33 +268,37 @@ function outcomeOf(status) {
   }
 }
 
-// Build the Verdict/E2E/Coverage (qa) or Syntax (implement) check breakdown for
-// a runlog gate entry, INFERRING the sequence from the single deciding source:
-// the QA gate runs verdict -> e2e -> coverage and stops at the first failure, so
-// the deciding source tells us which earlier checks implicitly passed.
+// Build the per-gate check breakdown for a runlog gate entry: Syntax (implement),
+// Review CLEAN/BLOCKER (review), or E2E + Coverage (qa). QA is deterministic now:
+// runQaGate runs E2E then — only when the test stage is enabled — coverage, and
+// stops at the first failure, so the deciding source tells us how far it got.
 function gateChecks(e) {
   if (e.stage === "implement") {
     const ok = e.approved === true;
     return [{ label: "Syntax", value: ok ? "PASS" : "FAIL", kind: ok ? "pass" : "fail" }];
   }
+  if (e.stage === "review") {
+    const ok = e.approved === true;
+    return [{ label: "Review", value: ok ? "CLEAN" : "BLOCKER", kind: ok ? "pass" : "fail" }];
+  }
   if (e.stage !== "qa") return null;
-  const order = ["verdict", "e2e", "coverage"];
-  const src = e.gateSource;
   const passed = e.approved === true;
   const infra = e.gateKind === "infra-failure";
-  const labels = { verdict: "Verdict", e2e: "E2E", coverage: "Coverage" };
-  const stopAt = passed ? order.length : Math.max(0, order.indexOf(src));
-  return order.map((k, i) => {
-    let value, kind;
-    if (passed) { value = k === "verdict" ? "SHIP" : "PASS"; kind = "pass"; }
-    else if (i < stopAt) { value = k === "verdict" ? "SHIP" : "PASS"; kind = "pass"; }
-    else if (i === stopAt) {
-      if (k === "verdict") { value = "NO-SHIP"; kind = "fail"; }
-      else if (k === "e2e") { value = infra ? "INFRA" : "FAIL"; kind = infra ? "infra" : "fail"; }
-      else { value = "GAP"; kind = "fail"; }
-    } else { value = "n/a"; kind = "na"; }
-    return { label: labels[k], value, kind };
-  });
+  const src = e.gateSource;
+  // E2E passed outright, or implicitly because coverage was the deciding step.
+  const e2e =
+    passed || src === "coverage"
+      ? { label: "E2E", value: "PASS", kind: "pass" }
+      : { label: "E2E", value: infra ? "INFRA" : "FAIL", kind: infra ? "infra" : "fail" };
+  // Coverage runs only when the test stage is enabled. A PASS decided by source
+  // "e2e" means coverage was skipped (test disabled); a fail with source
+  // "coverage" is a gap; a fail decided by "e2e" means coverage never ran.
+  let coverage;
+  if (passed && src === "e2e") coverage = { label: "Coverage", value: "SKIPPED", kind: "na" };
+  else if (passed) coverage = { label: "Coverage", value: "PASS", kind: "pass" };
+  else if (src === "coverage") coverage = { label: "Coverage", value: "GAP", kind: "fail" };
+  else coverage = { label: "Coverage", value: "n/a", kind: "na" };
+  return [e2e, coverage];
 }
 
 // ---------- global model ----------

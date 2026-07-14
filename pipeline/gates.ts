@@ -15,12 +15,12 @@ import { join } from "node:path";
 // infra-failure; the other checks are either pass or real-failure.
 export type GateKind = "pass" | "real-failure" | "infra-failure";
 
-// Which check produced this result. The QA belt routes a failure to the stage
-// that OWNS the fix based on this: a failing test or a NO-SHIP verdict means
-// the CODE is wrong -> implement; a coverage gap means a test is MISSING ->
-// test. Crucially, a failing test is never routed back to the test agent "to
-// make it pass" — that would invite weakening tests to go green.
-export type GateSource = "checks" | "e2e" | "coverage" | "verdict";
+// Which check produced this result. The belt routes a failure to the stage
+// that OWNS the fix based on this: a failing test (e2e) or a [BLOCKER] review
+// finding means the CODE is wrong -> implement; a coverage gap means a test is
+// MISSING -> test. Crucially, a failing test is never routed back to the test
+// agent "to make it pass" — that would invite weakening tests to go green.
+export type GateSource = "checks" | "e2e" | "coverage" | "review";
 
 export type GateResult = {
   passed: boolean;
@@ -115,27 +115,59 @@ export async function runE2E(workdir: string, command: string): Promise<GateResu
   };
 }
 
-// The QA agent (a model) writes the verdict; this function (a dumb script)
-// reads it. Determinism at the boundary: a model may produce the judgment,
-// but a script decides whether the pipeline proceeds, and it reads a file
-// the model was not allowed to write. qa/ lives in the pipeline repo, same
-// as every other artifact — artifacts stay here, only build/test commands
-// run against the product repo.
-export function checkQaVerdict(ticketId: string): GateResult {
-  const path = `qa/${ticketId}.md`;
-  if (!existsSync(path)) {
-    return { passed: false, output: `No QA report at ${path}`, kind: "real-failure", source: "verdict" };
+// A [BLOCKER] finding is machine-recognized only when its tag is the FIRST
+// token of a bullet: optional list marker, optional bold, then the literal
+// [BLOCKER]. Anchoring this way means prose mentions ("considered a [BLOCKER]
+// but…") and the "No blocking findings." line never false-trigger — the same
+// care acceptanceCriteriaSection takes to avoid phantom AC-N matches.
+const REVIEW_BLOCKER = /^[ \t]*(?:[-*][ \t]+)?\*{0,2}\[BLOCKER\]/i;
+// The boundary between findings: the next [BLOCKER]/[MINOR] bullet, or a heading.
+const REVIEW_FINDING = /^[ \t]*(?:[-*][ \t]+)?\*{0,2}\[(?:BLOCKER|MINOR)\]/i;
+const MD_HEADING = /^#{1,6}[ \t]/;
+
+// Pulls each [BLOCKER] finding — its tag line plus the continuation/sub-bullet
+// lines that belong to it — out of the review markdown, so the belt can hand
+// implement the exact reasons. A finding ends at the next tagged finding, the
+// next heading, or EOF.
+function extractBlockers(md: string): string[] {
+  const lines = md.split("\n");
+  const out: string[] = [];
+  for (let i = 0; i < lines.length; i++) {
+    if (!REVIEW_BLOCKER.test(lines[i])) continue;
+    const chunk = [lines[i]];
+    let j = i + 1;
+    for (; j < lines.length && !REVIEW_FINDING.test(lines[j]) && !MD_HEADING.test(lines[j]); j++) {
+      chunk.push(lines[j]);
+    }
+    out.push(chunk.join("\n").trim());
+    i = j - 1;
   }
-  const md = readFileSync(path, "utf8");
-  const hasFail = /\|\s*FAIL\s*\|/i.test(md);
-  const saysShip = /Verdict:\s*SHIP/i.test(md);
-  const passed = saysShip && !hasFail;
-  return {
-    passed,
-    output: !saysShip ? "No SHIP verdict found" : hasFail ? "QA report has FAIL rows" : "SHIP",
-    kind: passed ? "pass" : "real-failure",
-    source: "verdict",
-  };
+  return out;
+}
+
+// The review agent (a model) surfaces findings; this dumb script decides whether
+// any are blocking. Determinism at the boundary: the model produces the review,
+// a script decides whether the pipeline proceeds, reading a file in a format the
+// role prompt guarantees is machine-readable (reviews/ lives in the pipeline
+// repo, same as every other artifact). Only ever fails on an explicit [BLOCKER]
+// tag, so it can never fabricate a block; a real issue the agent forgot to tag
+// is the human-escalation's job — the same conservative stance checkCoverage
+// takes when it only ever WITHHOLDS credit.
+export function checkReview(ticketId: string): GateResult {
+  const path = `reviews/${ticketId}.md`;
+  if (!existsSync(path)) {
+    return { passed: false, output: `No review report at ${path}`, kind: "real-failure", source: "review" };
+  }
+  const blockers = extractBlockers(readFileSync(path, "utf8"));
+  if (blockers.length > 0) {
+    return {
+      passed: false,
+      output: `Review found ${blockers.length} blocking finding(s):\n\n${blockers.join("\n\n")}`,
+      kind: "real-failure",
+      source: "review",
+    };
+  }
+  return { passed: true, output: "No blocking findings.", kind: "pass", source: "review" };
 }
 
 // Recursively collect files under dir whose name matches the test pattern.
@@ -192,7 +224,7 @@ const META_MARKER = /\b(?:TODO|FIXME|XXX)\b/i;
 // COVERS: tags from the product's test files (written by test). Passes only if
 // every criterion is covered by at least one live test. The model produces the
 // criteria and the tags; this dumb script decides whether coverage is complete
-// — the same determinism boundary as checkQaVerdict. The ticket is read
+// — the same determinism boundary as checkReview. The ticket is read
 // pipeline-relative (tickets/<id>.md); testDir is in the PRODUCT repo.
 export function checkCoverage(ticketId: string, testDir: string): GateResult {
   const ticketPath = `tickets/${ticketId}.md`;

@@ -15,10 +15,27 @@ recorded convention or decision is a finding. Read only the concepts you need.
 
 # Output contract
 Produce ONLY a markdown review:
+
 ## Findings
-- [BLOCKER] ... (a correctness or spec-violation issue that must be fixed)
-- [MINOR] ... (style, clarity, non-blocking)
-If nothing is wrong, write "No blocking findings." explicitly.
+Emit one bullet per finding. Each finding MUST begin with its tag as the FIRST
+token of the bullet — one of `[BLOCKER]` or `[MINOR]` (bold is allowed, e.g.
+`**[BLOCKER]**`):
+
+- [BLOCKER] <a correctness or spec/convention violation that MUST be fixed before ship>
+- [MINOR] <style, clarity, or otherwise non-blocking observation>
+
+Keep all detail for a finding inside its own bullet; indented sub-bullets are
+fine, but do NOT start a sub-bullet with another `[...]` tag. If there are no
+blocking issues, write the single line `No blocking findings.` (use `[MINOR]`
+bullets for any non-blocking notes).
+
+# Your findings now have teeth
+A deterministic gate scans this file for `[BLOCKER]` bullets. If it finds any,
+the pipeline sends the code BACK to the IMPLEMENT stage with your blocker text
+as the fix instructions, then re-runs you — bounded, then a human is summoned.
+So tag `[BLOCKER]` only for issues that genuinely must be fixed before ship;
+everything else is `[MINOR]`. Be specific and actionable: your blocker bullet IS
+the implementer's brief.
 
 # Rules
 - Check every acceptance criterion has corresponding code.
@@ -28,5 +45,6 @@ If nothing is wrong, write "No blocking findings." explicitly.
 - Never edit files. Findings only.
 
 # Quality bar
-Accepted when every acceptance criterion is accounted for and any real
-issue is tagged BLOCKER.
+Accepted when every acceptance criterion is accounted for, every must-fix issue
+is a `[BLOCKER]` bullet in the exact form above, and non-blocking notes are
+`[MINOR]`.

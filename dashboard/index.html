@@ -172,13 +172,14 @@ const titleCache = new Map();      // id -> { title, branch }
 const artifactCache = new Map();   // "dir/id" -> { status:'ok'|'missing', body }
 const prefetched = new Set();      // ids we've kicked a full artifact prefetch for
 
-const DIRS = ['tickets', 'specs', 'reviews', 'qa', 'retros'];
+const DIRS = ['tickets', 'specs', 'reviews', 'qa', 'retros', 'curator'];
 const TABS = [
-  ['ticket', 'Ticket',    'tickets'],
-  ['spec',   'Spec',      'specs'],
-  ['review', 'Review',    'reviews'],
-  ['qa',     'QA Report', 'qa'],
-  ['retro',  'Retro',     'retros'],
+  ['ticket',  'Ticket',    'tickets'],
+  ['spec',    'Spec',      'specs'],
+  ['review',  'Review',    'reviews'],
+  ['qa',      'QA Report', 'qa'],
+  ['retro',   'Retro',     'retros'],
+  ['curator', 'Curator',   'curator'],
 ];
 const MISS_NOTE = {
   ticket: 'No ticket file found for this id.',
@@ -186,6 +187,7 @@ const MISS_NOTE = {
   review: 'The Review stage has not produced output yet.',
   qa:     'The QA gate has not run yet — earlier stages may still be in progress or awaiting approval.',
   retro:  'No retrospective has been written for this ticket yet.',
+  curator: 'The Curator has not run for this ticket yet — it runs after a ticket ships, when learning is enabled.',
 };
 
 async function fetchText(url) { try { const r = await fetch(url); return r.ok ? await r.text() : ''; } catch { return ''; } }
@@ -242,7 +244,7 @@ async function refreshOpenArtifacts(id) {
   return changed;
 }
 function defaultTab(id) {
-  for (const [tab, , dir] of [['qa', 0, 'qa'], ['review', 0, 'reviews'], ['spec', 0, 'specs'], ['ticket', 0, 'tickets'], ['retro', 0, 'retros']]) {
+  for (const [tab, , dir] of [['qa', 0, 'qa'], ['review', 0, 'reviews'], ['spec', 0, 'specs'], ['ticket', 0, 'tickets'], ['retro', 0, 'retros'], ['curator', 0, 'curator']]) {
     const rec = artifactCache.get(dir + '/' + id);
     if (rec && rec.status === 'ok') return tab;
   }
@@ -836,7 +838,10 @@ function renderKbSection(sel) {
   } else {
     inner = entries.map(([stageKey, info]) => {
       const st = STAGES.find(s => s.key === stageKey);
-      const label = st ? st.label : stageKey;
+      // Learning-loop stages aren't in STAGES (they'd pollute the pipeline lane/
+      // stats); give them friendly labels here instead of the raw event key.
+      const KB_LABELS = { 'curator-product': 'Curator', retrospector: 'Retrospector' };
+      const label = st ? st.label : (KB_LABELS[stageKey] || stageKey);
       const offered = !!info.offered;
       const reads = info.reads || [];
       const badgeCol = offered ? COLORS.done : '#5c6773';

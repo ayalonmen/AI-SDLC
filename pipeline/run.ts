@@ -11,7 +11,7 @@ import { readFileSync, appendFileSync, existsSync, mkdirSync, writeFileSync } fr
 import { resolve, relative, sep, isAbsolute } from "node:path";
 import { spawn, spawnSync } from "node:child_process";
 import { createInterface } from "node:readline/promises";
-import { runChecks, runE2E, GateResult, checkQaVerdict, checkCoverage } from "./gates";
+import { runChecks, runE2E, GateResult, checkReview, checkCoverage } from "./gates";
 import { checkBundle, PRODUCT_KB_SPEC } from "./kb-conformance";
 
 type StageMode = "manual" | "approve" | "auto";
@@ -70,6 +70,12 @@ const MAX_INFRA_RETRIES = 2;
 // implement (which has its own syntax gate), then QA re-runs. Bounded like the
 // implement belt so a persistently-failing feature summons a human.
 const MAX_QA_ATTEMPTS = 3;
+
+// Cap on the review -> implement -> review belt. A [BLOCKER] review finding
+// means the CODE is wrong, so work goes back to implement (with the blocker
+// text as feedback), then review re-runs. Bounded like the implement/QA belts
+// so a persistently-blocked change summons a human instead of looping forever.
+const MAX_REVIEW_ATTEMPTS = 3;
 
 // The pipeline's fixed stage sequence. Both the auto-resume logic and the
 // default run order in main() walk this same list, so adding a stage
@@ -699,6 +705,13 @@ async function runQaGate(ticketId: string, ctx: Ctx): Promise<GateResult> {
   }
   if (!e2e!.passed) return e2e!; // real-failure: a test genuinely failed
 
+  // Coverage is only meaningful when the test stage runs. With `test` disabled
+  // there are no COVERS tags to find, so requiring coverage would make every
+  // ticket with a new acceptance criterion unpassable — gate on E2E alone
+  // instead. (Disabling test opts out of the whole test+coverage discipline;
+  // a test-disabled product doesn't even need e2e.testDir declared.)
+  if (!stageEnabled(ctx, "test")) return e2e!;
+
   // Tests pass — now check they cover every acceptance criterion. testDir must
   // be declared: defaulting to scanning the whole product repo is slow and can
   // pick up unrelated test files. Fail loudly like the rest of the descriptor
@@ -733,12 +746,12 @@ async function runQaGate(ticketId: string, ctx: Ctx): Promise<GateResult> {
 //      longer implement's gate — that moved to QA (runQaGate), which routes
 //      failures back here via the QA belt (see runStageQa).
 
-// seedFeedback lets a caller (the QA belt) start the implement agent off with
-// an explicit reason it's being re-run — e.g. a failing E2E assertion or a
-// NO-SHIP verdict — instead of re-running it blind against the unchanged spec.
-// Without it, the agent has no signal about what to change and tends to
-// reproduce the same code. The current branch already holds its prior work,
-// which it reads, so we don't need to re-supply the old output verbatim.
+// seedFeedback lets a caller (the QA or review belt) start the implement agent
+// off with an explicit reason it's being re-run — e.g. a failing E2E assertion
+// or a [BLOCKER] review finding — instead of re-running it blind against the
+// unchanged spec. Without it, the agent has no signal about what to change and
+// tends to reproduce the same code. The current branch already holds its prior
+// work, which it reads, so we don't need to re-supply the old output verbatim.
 async function runStageImplement(
   ticketId: string,
   mode: StageMode,
@@ -823,19 +836,103 @@ function writeReview(ticketId: string, output: string): void {
   writeFileSync(`reviews/${ticketId}.md`, output);
 }
 
-function runStageReview(ticketId: string, mode: StageMode, ctx: Ctx): Promise<void> {
-  return runStage(
-    {
+// Review is now a GATED, belted stage — not a plain runStage. The agent writes
+// findings; a deterministic script (checkReview) decides whether any are
+// [BLOCKER]. A blocker means the CODE is wrong, so the belt routes to IMPLEMENT
+// with the blocker text as the fix brief, then review re-runs — capped at
+// MAX_REVIEW_ATTEMPTS, then a human. It doesn't fit runStage() for the same
+// reason implement/qa don't: its gate is a script, and a failing gate isn't the
+// review agent's own to fix.
+//
+// mode governs ONLY the human pause on the review TEXT (approve => y/n before
+// the gate; reject re-runs the agent in place with feedback). The [BLOCKER] gate
+// runs regardless of mode, exactly like implement's syntax gate and QA's E2E
+// gate — a deterministic gate is not something a mode can switch off.
+async function runStageReview(ticketId: string, mode: StageMode, ctx: Ctx): Promise<void> {
+  const spec = readSpec(ticketId);
+  const kb = readKbIndex(ctx.paths.knowledgeDir);
+
+  for (let attempt = 1; attempt <= MAX_REVIEW_ATTEMPTS; attempt++) {
+    const startedAt = Date.now();
+    emitEvent("stage_started", { ticket: ticketId, stage: "review", attempt, mode });
+
+    // Produce findings (agent), with the approve-mode human loop. A human reject
+    // re-runs the agent in place (unbounded — a person is present), same as
+    // runStage's reject loop; it does not consume a belt attempt.
+    let retry: RetryContext | undefined;
+    // eslint-disable-next-line no-constant-condition
+    while (true) {
+      const prompt = buildPrompt(ctx.paths.workdir, "agents/review.md", spec, retry, kb);
+      emitEvent("agent_started", { ticket: ticketId, stage: "review", kb: { offered: !!kb, dir: kb ? kb.dir : undefined } });
+      console.log(`\nRunning review agent on ticket ${ticketId} (attempt ${attempt}/${MAX_REVIEW_ATTEMPTS})...\n`);
+      const output = await callAgent(prompt, {
+        cwd: ctx.paths.workdir,
+        allowedTools: ["Read"],
+        addDir: kb ? kb.dir : undefined,
+        ticket: ticketId,
+        stage: "review",
+      });
+      console.log(`----- review agent output -----\n`);
+      console.log(output);
+      console.log("\n-------------------------------\n");
+      writeReview(ticketId, output);
+
+      if (mode !== "approve") break;
+      emitEvent("awaiting_approval", { ticket: ticketId, stage: "review" });
+      if (await confirm("Approve this review?")) break;
+      retry = { priorAttempt: output, feedback: await promptText("What should change?") };
+    }
+
+    // Deterministic blocker gate — runs regardless of mode.
+    const gate = checkReview(ticketId);
+    logRun({
       stage: "review",
-      ticketId,
+      ticket: ticketId,
       mode,
-      roleFile: "agents/review.md",
-      getInput: () => readSpec(ticketId),
-      allowedTools: ["Read"],
-      usesKb: true,
-      onApprove: (output) => writeReview(ticketId, output),
-    },
-    ctx
+      attempt,
+      durationMs: Date.now() - startedAt,
+      approved: gate.passed,
+      gateKind: gate.kind,
+      gateSource: gate.source,
+    });
+    emitEvent("gate_result", { ticket: ticketId, stage: "review", source: gate.source, kind: gate.kind, passed: gate.passed, attempt });
+
+    if (gate.passed) {
+      console.log("Review gate passed (no blocking findings).");
+      emitEvent("stage_finished", { ticket: ticketId, stage: "review", approved: true, durationMs: Date.now() - startedAt, attempt });
+      return;
+    }
+
+    if (attempt >= MAX_REVIEW_ATTEMPTS) break;
+
+    // A [BLOCKER] is the CODE's problem -> implement owns the fix. Honor the
+    // enabled flag: if implement is off, the pipeline can't auto-fix, so stop
+    // for a human (mirror of QA's belt guard).
+    if (!stageEnabled(ctx, "implement")) {
+      console.log("Review found blockers but implement is disabled (enabled:false) — stopping for a human.");
+      emitEvent("stage_finished", { ticket: ticketId, stage: "review", approved: false, reason: "belt-target-disabled", beltTarget: "implement", attempt });
+      throw new Error(
+        `Review found [BLOCKER] finding(s) for ticket ${ticketId} that the implement stage owns, but implement ` +
+          `is disabled (enabled:false) in sdlc.config.json — the pipeline will not run a stage you turned off. ` +
+          `Re-enable implement (or resolve by hand), then re-run review.\n\n${gate.output}`
+      );
+    }
+    console.log("Review found BLOCKER(s). Re-running the IMPLEMENT stage with the blocker details, then re-reviewing.");
+    emitEvent("belt_route", { ticket: ticketId, from: "review", to: "implement", reason: "blocker", attempt });
+    emitEvent("stage_finished", { ticket: ticketId, stage: "review", approved: false, durationMs: Date.now() - startedAt, attempt });
+    await runStageImplement(
+      ticketId,
+      ctx.config.stages.implement?.mode ?? "auto",
+      ctx,
+      ctx.config.stages.implement?.maxTurns,
+      `The review stage found blocking issues. Fix the code so these are resolved (do not try to silence the reviewer):\n${gate.output}`
+    );
+  }
+
+  emitEvent("stage_finished", { ticket: ticketId, stage: "review", approved: false, reason: "exhausted", attempt: MAX_REVIEW_ATTEMPTS });
+  throw new Error(
+    `Review still reports [BLOCKER] finding(s) for ticket ${ticketId} after ${MAX_REVIEW_ATTEMPTS} attempts. ` +
+      `See reviews/${ticketId}.md and inspect the branch — the pipeline does not retry further.`
   );
 }
 
@@ -866,55 +963,77 @@ function runStageTest(ticketId: string, mode: StageMode, ctx: Ctx, seedFeedback?
   );
 }
 
-// Writes the QA agent's narrative report to qa/<id>.md in the PIPELINE repo.
-// The agent returns text (like review/spec); the orchestrator writes the file.
-// Determinism boundary: checkQaVerdict later reads a file the model never wrote.
-function writeQaReport(ticketId: string, output: string): void {
+// Writes a DETERMINISTIC qa/<id>.md summary (no model involved) so the
+// dashboard's QA tab stays meaningful now that QA has no agent. The E2E/coverage
+// breakdown is inferred from the single deciding GateResult exactly as the
+// dashboard's gateChecks does: runQaGate runs E2E then coverage and stops at the
+// first failure, so gate.source says how far it got. testEnabled=false means the
+// test stage is off and coverage was intentionally skipped. Renders through the
+// dashboard's parseMd/cellColor (heading + pipe table + fenced detail).
+function writeQaSummary(ticketId: string, gate: GateResult, testEnabled: boolean): void {
   mkdirSync("qa", { recursive: true });
-  writeFileSync(`qa/${ticketId}.md`, output);
+
+  const e2ePassed = gate.passed || gate.source === "coverage"; // coverage only runs if E2E passed
+  const e2eLabel = e2ePassed ? "PASS" : gate.kind === "infra-failure" ? "INFRA" : "FAIL";
+  const coverageLabel = !testEnabled
+    ? "SKIPPED"
+    : gate.passed
+      ? "PASS"
+      : gate.source === "coverage"
+        ? "FAIL"
+        : "n/a"; // E2E failed first; coverage never ran
+
+  const md = [
+    `## QA Gate: ${ticketId}`,
+    "",
+    "Deterministic gate — no agent. QA passes iff the E2E suite is green" +
+      (testEnabled
+        ? " and every acceptance criterion has a live COVERS tag."
+        : " (coverage skipped: the test stage is disabled)."),
+    "",
+    "| Check | Result |",
+    "|----------|--------|",
+    `| E2E | ${e2eLabel} |`,
+    `| Coverage | ${coverageLabel} |`,
+    "",
+    `Verdict: ${gate.passed ? "SHIP" : "NO-SHIP"}`,
+    "",
+    "### Detail",
+    "",
+    "```",
+    gate.output.trim(),
+    "```",
+    "",
+  ].join("\n");
+
+  writeFileSync(`qa/${ticketId}.md`, md);
 }
 
-// QA is the authoritative gate stage. It does not fit runStage (its gate is a
-// script, not a human y/n) or runStageImplement (a QA failure isn't QA's own to
-// fix). Flow per attempt:
-//   1. run the qa agent read-only; it writes a SHIP/NO-SHIP report as text
-//   2. orchestrator writes qa/<id>.md from that text
-//   3. checkQaVerdict (script) reads the verdict
-//   4. runQaGate (script) runs the full E2E suite + coverage check
-//   5. if all pass -> done. If any fail -> ROUTE BY FAILURE TYPE to the stage
-//      that owns the fix, re-run QA, capped at MAX_QA_ATTEMPTS, then hand to a
-//      human.
+// QA is now a purely DETERMINISTIC gate stage — no agent, no verdict. It passes
+// iff the E2E suite is green (and, when the test stage is enabled, every
+// acceptance criterion has a live COVERS tag — see runQaGate). The orchestrator
+// still WRITES a deterministic qa/<id>.md summary so the dashboard's QA tab
+// stays meaningful. It does not fit runStage (its gate is a script, not a human
+// y/n) or runStageImplement (a QA failure isn't QA's own to fix).
 //
-// The routing is the point. A failing E2E test or a NO-SHIP verdict means the
-// CODE doesn't meet a criterion -> re-run IMPLEMENT (with the failure threaded
-// in) to fix the code. A coverage gap means a test is MISSING -> re-run TEST
-// (told which AC-N) to ADD it. A failing test is never routed back to the test
-// agent "to make it pass" — that would invite weakening the test to go green;
-// a red test is always the code's problem, and if the code genuinely can't
-// satisfy it, implement exhausts its attempts and a human is summoned with the
-// test still honest.
+// The routing is the point. A failing E2E test means the CODE doesn't meet a
+// criterion -> re-run IMPLEMENT (with the failing assertions threaded in). A
+// coverage gap means a test is MISSING -> re-run TEST (told which AC-N) to ADD
+// it. A failing test is never routed back to the test agent "to make it pass" —
+// that would invite weakening the test to go green; a red test is always the
+// code's problem, and if the code genuinely can't satisfy it, implement exhausts
+// its attempts and a human is summoned with the test still honest.
 async function runStageQa(ticketId: string, mode: StageMode, ctx: Ctx): Promise<void> {
+  const testEnabled = stageEnabled(ctx, "test");
+
   for (let attempt = 1; attempt <= MAX_QA_ATTEMPTS; attempt++) {
     const startedAt = Date.now();
-    const spec = readSpec(ticketId);
-    const prompt = buildPrompt(ctx.paths.workdir, "agents/qa.md", spec);
 
     emitEvent("stage_started", { ticket: ticketId, stage: "qa", attempt });
-    emitEvent("agent_started", { ticket: ticketId, stage: "qa", kb: { offered: false } });
 
-    console.log(`\nRunning qa agent on ticket ${ticketId} (attempt ${attempt}/${MAX_QA_ATTEMPTS})...\n`);
-    const report = await callAgent(prompt, { cwd: ctx.paths.workdir, allowedTools: ["Read"], ticket: ticketId, stage: "qa" });
-
-    console.log(`----- qa agent report -----\n`);
-    console.log(report);
-    console.log("\n-------------------------------\n");
-
-    writeQaReport(ticketId, report);
-
-    // Two dumb scripts decide, in order: the agent's own verdict, then the
-    // authoritative gate (full E2E + coverage). Both must pass.
-    const verdict = checkQaVerdict(ticketId);
-    const gate = verdict.passed ? await runQaGate(ticketId, ctx) : verdict;
+    console.log(`\nRunning QA gate on ticket ${ticketId} (attempt ${attempt}/${MAX_QA_ATTEMPTS})...\n`);
+    const gate = await runQaGate(ticketId, ctx); // E2E [+ coverage when test enabled]
+    writeQaSummary(ticketId, gate, testEnabled); // deterministic qa/<id>.md for the dashboard
 
     logRun({
       stage: "qa",
@@ -929,7 +1048,7 @@ async function runStageQa(ticketId: string, mode: StageMode, ctx: Ctx): Promise<
     emitEvent("gate_result", { ticket: ticketId, stage: "qa", source: gate.source, kind: gate.kind, passed: gate.passed, attempt });
 
     if (gate.passed) {
-      console.log(`QA passed (verdict SHIP, full suite green, coverage complete).`);
+      console.log(`QA passed (E2E green${testEnabled ? ", coverage complete" : ", coverage skipped — test stage disabled"}).`);
       emitEvent("stage_finished", { ticket: ticketId, stage: "qa", approved: true, durationMs: Date.now() - startedAt, attempt });
       return;
     }
@@ -979,22 +1098,16 @@ async function runStageQa(ticketId: string, mode: StageMode, ctx: Ctx): Promise<
           `test tagged "// COVERS: <AC-N>". Do NOT weaken, skip, or delete existing tests to pass.`
       );
     } else {
-      // A failing E2E test or a NO-SHIP verdict — the CODE is wrong, so route
-      // to implement with the specifics. For an E2E failure the failing
-      // assertions are the most useful feedback; for a verdict rejection the
-      // QA report's FAIL rows are.
-      const feedback =
-        gate.source === "verdict"
-          ? `The QA judge rejected the implementation. QA report:\n${readFileSync(`qa/${ticketId}.md`, "utf8")}`
-          : `The QA end-to-end suite failed. Fix the code so these pass (do not change the tests):\n${gate.output}`;
-      console.log(`QA ${gate.source} failure. Re-running the IMPLEMENT stage with the failure details.`);
+      // A failing E2E test — the CODE is wrong, so route to implement with the
+      // failing assertions (the most useful feedback).
+      console.log(`QA E2E failure. Re-running the IMPLEMENT stage with the failing assertions.`);
       emitEvent("belt_route", { ticket: ticketId, from: "qa", to: "implement", reason: gate.source, attempt });
       await runStageImplement(
         ticketId,
         ctx.config.stages.implement?.mode ?? "auto",
         ctx,
         ctx.config.stages.implement?.maxTurns,
-        feedback
+        `The QA end-to-end suite failed. Fix the code so these pass (do not change the tests):\n${gate.output}`
       );
     }
   }
@@ -1002,7 +1115,7 @@ async function runStageQa(ticketId: string, mode: StageMode, ctx: Ctx): Promise<
   emitEvent("stage_finished", { ticket: ticketId, stage: "qa", approved: false, reason: "exhausted", attempt: MAX_QA_ATTEMPTS });
   throw new Error(
     `QA failed for ticket ${ticketId} after ${MAX_QA_ATTEMPTS} attempts. ` +
-      `Last verdict/gate output in qa/${ticketId}.md. Inspect the branch — ` +
+      `Last gate output in qa/${ticketId}.md. Inspect the branch — ` +
       `the pipeline does not retry further.`
   );
 }
@@ -1021,8 +1134,16 @@ function readTicketRunlog(ticketId: string): string {
 // Gathers this ticket's runlog slice + its artifacts into one input blob. The
 // artifacts live in THIS repo (the handoff protocol), so they're read
 // pipeline-local, not from the product repo.
-function gatherRetroInput(ticketId: string): string {
+function gatherRetroInput(ticketId: string, failureNote?: string): string {
   const parts: string[] = [];
+  // A failed/aborted run is the highest-signal input for the Retrospector, so
+  // surface the outcome up front when we're running it after a failure.
+  if (failureNote) {
+    parts.push(
+      "## Run outcome\nThis run FAILED and did NOT ship — the pipeline aborted. " +
+        "Reflect on the root cause and what would have prevented it.\n\n" + failureNote
+    );
+  }
   parts.push("## Runlog\n" + readTicketRunlog(ticketId));
   for (const [label, path] of [
     ["Ticket", `tickets/${ticketId}.md`],
@@ -1042,15 +1163,17 @@ function writeRetroSummary(ticketId: string, output: string): void {
 
 // Per-ticket aggregation. Read-only and product-agnostic: it REPORTS what
 // happened; it does not touch code or any KB and gates nothing. Its summary is
-// advisory input to the Curator (added next). Runs after the writing flow
-// completes, gated by config.learning.enabled. Logged as its own stage but
-// NOT part of STAGE_ORDER, so it never affects auto-resume.
-async function runStageRetrospector(ticketId: string, ctx: Ctx): Promise<void> {
+// advisory input to the Curator. Runs after the writing flow, on SUCCESS OR
+// FAILURE (a belted/aborted run is the most instructive — it must not be lost),
+// gated by config.learning.enabled. Logged as its own stage but NOT part of
+// STAGE_ORDER, so it never affects auto-resume. failureNote, when present, tells
+// the Retrospector the run failed (and why) so it reflects on the failure.
+async function runStageRetrospector(ticketId: string, ctx: Ctx, failureNote?: string): Promise<void> {
   const startedAt = Date.now();
-  const input = gatherRetroInput(ticketId);
+  const input = gatherRetroInput(ticketId, failureNote);
   const prompt = buildPrompt(ctx.paths.workdir, "agents/retrospector.md", input);
 
-  emitEvent("stage_started", { ticket: ticketId, stage: "retrospector" });
+  emitEvent("stage_started", { ticket: ticketId, stage: "retrospector", outcome: failureNote ? "failed" : "complete" });
   emitEvent("agent_started", { ticket: ticketId, stage: "retrospector", kb: { offered: false } });
 
   console.log(`\nRunning retrospector on ticket ${ticketId}...\n`);
@@ -1146,6 +1269,64 @@ function resetBranch(kbDir: string, original: string, branch: string): void {
   runGit(kbDir, ["branch", "-D", branch]);
 }
 
+// The high-level prose the curator emits AROUND its file blocks — the NO CHANGE
+// reason, or the ## Summary (Inserted/Discarded/Unresolved). We strip the
+// ===FILE===…===END=== blocks (full concept bodies — not "high level") and keep
+// the rest, which is exactly what the Curator tab should show.
+function curatorProse(proposal: string): string {
+  return proposal
+    .replace(/===FILE:[\s\S]*?===END===/g, "")
+    .replace(/\n{3,}/g, "\n\n")
+    .trim();
+}
+
+// Writes a high-level curator/<id>.md so the dashboard's Curator tab can show,
+// per ticket, what the curator decided to insert into the KB vs discard — and
+// the PR/branch + shape-gate outcome. Deterministic header (paths only, never
+// file bodies) + the agent's own Inserted/Discarded/Unresolved prose. Called on
+// every real exit path of runCurator (NO CHANGE, malformed, conformance-fail,
+// push-fail, success) so the tab reflects whatever actually happened.
+function writeCuratorSummary(
+  ticketId: string,
+  info: {
+    outcome: string;
+    files?: Array<{ path: string }>;
+    branch?: string;
+    pushed?: boolean;
+    conformance?: "pass" | "fail" | "n/a";
+    violations?: string;
+    agentText: string;
+  }
+): void {
+  mkdirSync("curator", { recursive: true });
+  const filesList =
+    info.files && info.files.length ? info.files.map((f) => `- \`${f.path}\``).join("\n") : "— none —";
+  const pr = info.branch
+    ? info.pushed
+      ? `pushed \`${info.branch}\` to origin — open a PR to review/merge`
+      : `committed locally on \`${info.branch}\` — push failed, not yet on origin`
+    : "no branch pushed";
+  const conf = info.conformance === "pass" ? "PASS" : info.conformance === "fail" ? "FAIL" : "n/a";
+  const md = [
+    `## Curator: ${ticketId}`,
+    "",
+    `**Outcome:** ${info.outcome}`,
+    "",
+    "**Proposed to the KB (files):**",
+    filesList,
+    "",
+    `**PR / branch:** ${pr}`,
+    `**KB shape (conformance):** ${conf}`,
+    ...(info.violations ? ["", "```", info.violations, "```"] : []),
+    "",
+    "---",
+    "",
+    info.agentText || "_(no high-level summary provided by the curator)_",
+    "",
+  ].join("\n");
+  writeFileSync(`curator/${ticketId}.md`, md);
+}
+
 // The Curator: sole writer to a KB, deliberately picky, never writes directly.
 // It reads the KB's own CONVENTIONS + current index + the Retrospector summary
 // and proposes either "NO CHANGE" or conformance-checked concept files. The
@@ -1210,6 +1391,7 @@ async function runCurator(ticketId: string, ctx: Ctx, which: "product"): Promise
 
     if (/^\s*NO CHANGE\b/i.test(proposal)) {
       console.log(`Curator (${which}): no change proposed.`);
+      writeCuratorSummary(ticketId, { outcome: "NO CHANGE — nothing durable to record", conformance: "n/a", agentText: curatorProse(proposal) });
       logRun({ stage, ticket: ticketId, durationMs: Date.now() - startedAt, approved: true, change: false });
       emitEvent("stage_finished", { ticket: ticketId, stage, approved: true, change: false, durationMs: Date.now() - startedAt });
       return;
@@ -1222,6 +1404,7 @@ async function runCurator(ticketId: string, ctx: Ctx, which: "product"): Promise
         "===FILE: <path>=== ... ===END=== blocks. Emit exactly one of those two forms.";
       if (attempt >= MAX_CURATOR_ATTEMPTS) {
         console.log(`Curator (${which}) produced no usable file blocks; skipping.`);
+        writeCuratorSummary(ticketId, { outcome: "No usable proposal — neither NO CHANGE nor parseable file blocks", conformance: "n/a", agentText: curatorProse(proposal) });
         logRun({ stage, ticket: ticketId, durationMs: Date.now() - startedAt, approved: false, change: false });
         emitEvent("stage_finished", { ticket: ticketId, stage, approved: false, change: false, durationMs: Date.now() - startedAt });
         return;
@@ -1241,6 +1424,7 @@ async function runCurator(ticketId: string, ctx: Ctx, which: "product"): Promise
       resetBranch(kbDir, original, branch);
       if (attempt >= MAX_CURATOR_ATTEMPTS) {
         console.log(`Curator (${which}) could not produce conformant output after ${attempt} attempts; skipping (no push).`);
+        writeCuratorSummary(ticketId, { outcome: "Proposal rejected by the KB shape gate (conformance)", files, conformance: "fail", violations, agentText: curatorProse(proposal) });
         logRun({ stage, ticket: ticketId, durationMs: Date.now() - startedAt, approved: false, change: false });
         emitEvent("stage_finished", { ticket: ticketId, stage, approved: false, change: false, durationMs: Date.now() - startedAt });
         return;
@@ -1258,11 +1442,13 @@ async function runCurator(ticketId: string, ctx: Ctx, which: "product"): Promise
     runGit(kbDir, ["checkout", original]);
     if (!push.ok) {
       console.log(`Curator (${which}): conformant branch ${branch} committed locally but push failed: ${push.stderr}`);
+      writeCuratorSummary(ticketId, { outcome: "KB update committed locally; push to origin failed", files, branch, pushed: false, conformance: "pass", agentText: curatorProse(proposal) });
       logRun({ stage, ticket: ticketId, durationMs: Date.now() - startedAt, approved: true, change: true, branch, pushed: false });
       emitEvent("stage_finished", { ticket: ticketId, stage, approved: true, change: true, branch, pushed: false, durationMs: Date.now() - startedAt });
       return;
     }
     console.log(`Curator (${which}): pushed branch ${branch} to origin — open a PR to review/merge.`);
+    writeCuratorSummary(ticketId, { outcome: "Proposed KB update — open a PR to review/merge", files, branch, pushed: true, conformance: "pass", agentText: curatorProse(proposal) });
     logRun({ stage, ticket: ticketId, durationMs: Date.now() - startedAt, approved: true, change: true, branch, pushed: true });
     emitEvent("stage_finished", { ticket: ticketId, stage, approved: true, change: true, branch, pushed: true, durationMs: Date.now() - startedAt });
     return;
@@ -1393,26 +1579,41 @@ async function main(): Promise<void> {
     learning: !!ctx.config.learning?.enabled,
   });
 
+  // Run the writing flow, CAPTURING (not immediately rethrowing) a stage failure
+  // so the learning loop can still run afterward — a belted/aborted ticket is the
+  // highest-signal input for the Retrospector, and skipping it on failure (the old
+  // behavior) meant the most instructive runs taught nothing.
+  let writingError: unknown = null;
   try {
     const startIndex = STAGE_ORDER.indexOf(startStage);
     for (let i = startIndex; i < STAGE_ORDER.length; i++) {
       await runNamedStage(STAGE_ORDER[i], ticketId, ctx);
     }
-
-    // The learning loop runs after the writing flow completes for this ticket.
-    // The Retrospector aggregates what happened; the product Curator then judges
-    // it against the KB's conventions and proposes a conformance-checked branch
-    // for a human PR. Gated by config so the writing flow runs standalone. The
-    // pipeline Curator (a second KB) is deferred until that repo exists.
-    if (ctx.config.learning?.enabled) {
-      await runStageRetrospector(ticketId, ctx);
-      await runCurator(ticketId, ctx, "product");
-    }
   } catch (err) {
-    emitEvent("run_finished", { ticket: ticketId, outcome: "failed", error: err instanceof Error ? err.message : String(err) });
-    throw err;
+    writingError = err;
+  }
+  const errText = writingError ? (writingError instanceof Error ? writingError.message : String(writingError)) : undefined;
+
+  // Learning loop, gated by config. The Retrospector aggregates what happened, on
+  // SUCCESS OR FAILURE. The product Curator judges it against the KB's conventions
+  // and proposes a conformance-checked branch for a human PR — but ONLY on a clean
+  // run: it must cite a product-canonical source, and unshipped work has none (its
+  // code sits on feature/<id>, which the conformance gate bans). Learning is
+  // advisory, so its own errors are caught and logged, never allowed to mask the
+  // real run outcome.
+  if (ctx.config.learning?.enabled) {
+    try {
+      await runStageRetrospector(ticketId, ctx, errText);
+      if (!writingError) await runCurator(ticketId, ctx, "product");
+    } catch (learnErr) {
+      console.error("Learning loop error (non-fatal):", learnErr instanceof Error ? learnErr.message : String(learnErr));
+    }
   }
 
+  if (writingError) {
+    emitEvent("run_finished", { ticket: ticketId, outcome: "failed", error: errText });
+    throw writingError;
+  }
   emitEvent("run_finished", { ticket: ticketId, outcome: "complete" });
 }
 

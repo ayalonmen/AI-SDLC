@@ -49,9 +49,14 @@ external document) with all pipeline identifiers stripped out (see rule 4).
 
 ## Output — EXACTLY one of these two forms, no preamble
 
-FORM A — nothing durable to record (the common case). A single line:
+FORM A — nothing durable to record (the common case). A first line starting with
+`NO CHANGE`, then a short high-level note of what you weighed and discarded (a
+human and the dashboard's Curator tab read this):
 
     NO CHANGE - <one-line reason>
+
+    ## Discarded
+    - <candidate fact you considered> — <one line: why it isn't durable / already covered>
 
 FORM B — one or more proposed file writes. Emit each file as a block delimited
 EXACTLY like this (the orchestrator parses these markers literally):
@@ -60,8 +65,17 @@ EXACTLY like this (the orchestrator parses these markers literally):
     <full file content, including frontmatter>
     ===END===
 
-Then, after all file blocks, a short PR description paragraph (outside any
-block) summarizing what you changed and why, and flagging any UNRESOLVED items.
+Then, after all file blocks, a high-level `## Summary` (outside any block) that a
+human — and the dashboard's Curator tab — will read. Keep it high-level; do NOT
+restate file contents. Exactly these three parts:
+
+    ## Summary
+    ### Inserted / updated
+    - <concept path or title> — <one line: what it records and why it's durable>
+    ### Discarded
+    - <candidate fact you considered but did NOT record> — <one line: why (noise / already covered / not durable)>
+    ### Unresolved
+    - <anything you flagged UNRESOLVED for the human> (or "none")
 
 Rules for FORM B:
 - Paths are bundle-relative (e.g. `decisions/foo.md`), never absolute, never
